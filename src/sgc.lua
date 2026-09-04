@@ -39,6 +39,7 @@ local state = {
     iris_durability = nil,
     iris_max_durability = nil,
     iris_toggle_pending = false,
+    iris_pending_token = nil,
     iris_pending_direction = nil,
     iris_pending_since = nil,
 
@@ -263,6 +264,8 @@ local function find_gate()
 end
 
 local function ensure_gate()
+    local old_gate = state.gate
+
     if state.gate then
         local ok = pcall(state.gate.getGateStatus)
         if ok then
@@ -273,10 +276,20 @@ local function ensure_gate()
 
     local gate, name = find_gate()
     if not gate then
+        if old_gate ~= nil then
+            release_iris_lock()
+        end
         state.gate = nil
         state.gate_name = nil
         clear_gate_state()
         return false
+    end
+
+    if old_gate ~= nil and gate ~= old_gate then
+        -- A pending call may still be suspended against the old peripheral.
+        -- Invalidate that reservation before replacing the gate object.
+        release_iris_lock()
+        log_event("Gate peripheral changed; invalidated pending iris toggle")
     end
 
     local was_connected = state.connected
@@ -369,6 +382,7 @@ end
 
 local function release_iris_lock()
     state.iris_toggle_pending = false
+    state.iris_pending_token = nil
     state.iris_pending_direction = nil
     state.iris_pending_since = nil
 end
@@ -406,49 +420,71 @@ local function toggle_iris(direction, reason)
     end
 
     -- Acquire BEFORE the first yield.
+    local token = {}
     state.iris_toggle_pending = true
+    state.iris_pending_token = token
     state.iris_pending_direction = direction
     state.iris_pending_since = os.epoch("utc")
 
     refresh_gate()
 
     if not state.connected or not state.iris_state then
-        release_iris_lock()
-        log_event("IRIS " .. direction .. " REFUSED: iris state unknown")
+        if state.iris_pending_token == token then
+            release_iris_lock()
+            log_event("IRIS " .. direction .. " REFUSED: iris state unknown")
+        end
         return false
     end
 
     local bucket = iris_bucket()
 
     if bucket == "unknown" then
-        release_iris_lock()
-        log_event("IRIS " .. direction .. " REFUSED: iris state unknown/error")
+        if state.iris_pending_token == token then
+            release_iris_lock()
+            log_event("IRIS " .. direction .. " REFUSED: iris state unknown/error")
+        end
         return false
     end
 
     if bucket == "transition" then
-        release_iris_lock()
-        log_event("IRIS " .. direction .. " REFUSED: iris is already transitioning")
+        if state.iris_pending_token == token then
+            release_iris_lock()
+            log_event("IRIS " .. direction .. " REFUSED: iris is already transitioning")
+        end
         return false
     end
 
     if direction == "CLOSE" and bucket == "closed" then
-        release_iris_lock()
+        if state.iris_pending_token == token then
+            release_iris_lock()
+        end
         return true
     end
 
     if direction == "OPEN" and bucket == "open" then
-        release_iris_lock()
+        if state.iris_pending_token == token then
+            release_iris_lock()
+        end
         return true
     end
 
     if (direction == "CLOSE" and bucket ~= "open") or (direction == "OPEN" and bucket ~= "closed") then
-        release_iris_lock()
-        log_event("IRIS " .. direction .. " REFUSED: state changed before command")
+        if state.iris_pending_token == token then
+            release_iris_lock()
+            log_event("IRIS " .. direction .. " REFUSED: state changed before command")
+        end
         return false
     end
 
     local ok, success, code, message = safe_call(state.gate.toggleIris)
+
+    -- The call above may yield. A FORCE, peripheral reconnect, or iris
+    -- destruction may have invalidated this reservation while it was parked.
+    if state.iris_pending_token ~= token then
+        log_event("IRIS " .. direction .. " STALE COMPLETION IGNORED")
+        return false
+    end
+
     local worked, detail = jsg_result(ok, success, code, message)
 
     if not worked then
@@ -825,6 +861,7 @@ local function handle_jsg_event(event, ...)
         log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
         -- The physical iris no longer exists, so a software toggle reservation
         -- cannot remain meaningful.
+        state.iris_state = nil
         release_iris_lock()
 
     elseif event == "stargate_iris_out_of_power" then
