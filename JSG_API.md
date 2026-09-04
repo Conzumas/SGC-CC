@@ -8,32 +8,31 @@ This document intentionally lists only APIs verified from JSG source. Anything n
 
 Verified methods in `StargateAbstractCCMethods`:
 
-- `getJSGVersion()`
-- `getOpenedTime()`
-- `getStargateAddress()`
-- `getDialedAddress()`
-- `getEnergyStored()`
-- `getMaxEnergyStored()`
-- `getGateType()`
-- `getSymbolType()`
-- `getSymbolsMap()`
-- `getGateStatus()`
-- `getSymbolsNeeded(table)`
-- `getEnergyRequiredToDial(table)`
+- `getJSGVersion()` -> one value: version string
+- `getOpenedTime()` -> multiple values: success/code/minutes/seconds when connected
+- `getStargateAddress()` -> one value: table keyed by symbol-type ID, containing address symbol lists
+- `getDialedAddress()` -> one value: symbol-name list
+- `getEnergyStored()` -> one value: stored energy
+- `getMaxEnergyStored()` -> one value: maximum energy
+- `getGateType()` -> one value: gate type or nil
+- `getSymbolType()` -> one value: symbol-type ID or nil
+- `getSymbolsMap()` -> one value: symbol-name list
+- `getGateStatus()` -> multiple values, not a table:
+  - `false, "not_merged"` when not merged
+  - `true, "open", initiating` when engaged
+  - `true, "<state>"` otherwise
+- `getSymbolsNeeded(table)` -> multiple values: success/code/count or failure code
+- `getEnergyRequiredToDial(table)` -> multiple values: success/code/energy-map or failure code
 
-### Important return details
+### Energy map
 
-`getEnergyStored()` uses JSG's true stored-energy value.
+`getEnergyRequiredToDial(table)` returns an energy map containing:
 
-`getMaxEnergyStored()` uses JSG's true maximum-energy value.
+- `open`
+- `keepAlive`
+- `canOpen`
 
-`getGateStatus()` returns a table describing whether the gate is merged and its current state. When engaged, it also includes the initiating-side flag.
-
-`getStargateAddress()` returns address data keyed by symbol-type ID.
-
-`getDialedAddress()` returns the current dialed address as a list of symbol names.
-
-`getEnergyRequiredToDial(table)` returns values for `open`, `keepAlive`, and `canOpen`.
+`canOpen` reflects whether the gate currently has enough energy to meet the calculated opening cost.
 
 ## Classic gate CC methods
 
@@ -50,26 +49,75 @@ Verified methods in `StargateClassicCCMethods`:
 - `engageGate()`
 - `disengageGate()`
 - `engageSymbol(symbol)`
-- `dialAddress(...)`
+- `dialAddress(table_or_variadic)`
 - `spinRing(...)`
+
+### Important operation-result convention
+
+Most mutating JSG CC methods return normal Lua values of the form:
+
+`true, code, message, ...`
+
+or
+
+`false, code, message, ...`
+
+A Lua/API exception can also be thrown. Therefore callers must handle both:
+
+1. `pcall`/Lua failure, and
+2. JSG returning `success == false`.
+
+This applies to `toggleIris`, `dialAddress`, `abortDialing`, `engageGate`, `disengageGate`, `sendIrisCode`, and `engageSymbol`.
 
 ### Iris details
 
-`toggleIris()` requires an iris and requires the iris mode to be OC. It toggles the local iris state.
+`toggleIris()`:
 
-`getIrisState()` returns the JSG iris state enum name.
+- fails if no iris is installed
+- fails if the iris mode is not OC
+- can fail because the iris is busy
+- can fail because there is insufficient power
+- returns a normal success/failure result; these conditions do not necessarily throw
 
-`getIrisType()` returns the JSG iris type enum name.
+`getIrisState()` returns the JSG iris state enum name. Verified enum values are:
 
-`getIrisDurability()` returns current and maximum durability values.
+- `OPENED`
+- `CLOSED`
+- `OPENING`
+- `CLOSING`
+- `ERROR`
 
-`sendIrisCode(code)` sends an iris/GDO code across an active connection using JSG's `ComputerCodeSender` mechanism.
+`getIrisType()` returns the installed iris **type**, not the iris mode. The CC API reviewed here does not expose a separate `getIrisMode()` function.
 
-The receiving side also exposes the `stargate_iris_code_received` ComputerCraft event.
+`getIrisDurability()` returns three values:
+
+1. formatted durability string
+2. current durability
+3. maximum durability
+
+`sendIrisCode(code)` sends an iris/GDO code across an active connection. JSG performs the receiving-side iris-code processing.
+
+## `dialAddress` behavior
+
+JSG `dialAddress` explicitly supports both:
+
+- `dialAddress({symbol1, symbol2, ...})`
+- `dialAddress(symbol1, symbol2, ...)`
+
+When a table is supplied as the first argument, JSG reconstructs its ordered values before creating the address. Do not replace the table form with `table.unpack` merely because the Java method accepts variadic Lua arguments.
+
+A successful call returns:
+
+`true, "dial_begun", address_string`
+
+Common failure results include:
+
+- `false, "stargate_failure_not_merged", ...`
+- `false, "stargate_failure_busy", ...`
+- `false, "stargate_failure_not_empty", ...`
+- `false, "input_address_malformed", ...`
 
 ## Verified ComputerCraft events
-
-From `StargateComputerEvents`:
 
 - `stargate_spin_start`
 - `stargate_spin_stop`
@@ -102,49 +150,62 @@ From `StargateComputerEvents`:
 - `stargate_iris_out_of_power`
 - `stargate_ping`
 
-## Event payloads verified during source review
+### Important event payloads
 
-### `stargate_wormhole_incoming`
+`stargate_wormhole_incoming`:
 
-Carries the incoming address size.
+- argument 1: incoming address size
 
-### `stargate_wormhole_open_fully`
+`stargate_wormhole_open_fully`:
 
-Carries the address name list and an initiating-side boolean.
+- argument 1: address name list
+- argument 2: initiating-side boolean
 
-### `stargate_wormhole_close_fully`
+`stargate_wormhole_close_fully`:
 
-Carries the address name list, close reason, and initiating-side boolean.
+- argument 1: address name list
+- argument 2: close reason
+- argument 3: initiating-side boolean
 
-### `stargate_event_horizon_traveler`
+`stargate_event_horizon_traveler` for a player:
 
-Carries an inbound boolean and entity type. For players, JSG also provides UUID/name information.
+- argument 1: inbound boolean
+- argument 2: entity type
+- argument 3: player UUID
+- argument 4: player name
 
-### `stargate_iris_code_received`
+`stargate_iris_code_received`:
 
-Carries the received code string. The SGC UI should not normally print/store this plaintext code in its event log.
+- argument 1: plaintext received code
 
-### `stargate_iris_state_changed`
+The SGC event log must not record that plaintext code.
 
-Carries old and new iris states.
+Chevron engaged event:
 
-### `stargate_iris_out_of_power`
+- argument 1: source (`DHD`, `REMOTE`, `BY_SPIN`, or `INCOMING_WORMHOLE`)
+- argument 2: symbol name
+- argument 3: chevron index
+- argument 4: dialed-address size
 
-No payload.
+`stargate_iris_state_changed`:
 
-### Chevron events
+- argument 1: old iris state
+- argument 2: new iris state
 
-Chevron-engaged events include source, symbol name, chevron index, and dialed-address size. Sources include DHD, REMOTE, BY_SPIN, and INCOMING_WORMHOLE.
+`stargate_iris_type_changed`:
 
-## Not currently verified as a CC API
+- argument 1: old iris type
+- argument 2: new iris type
+
+## Not currently verified as CC APIs
 
 ### Temperature
 
-JSG has internal gate temperature behavior, but no `getTemperature()`-style CC method was verified in the inspected 1.20.1 CC classes. The SGC program must not invent one. Temperature monitoring remains pending API verification.
+JSG contains internal gate temperature behavior, but no CC-accessible temperature method was verified in the inspected 1.20.1 CC classes. Do not invent `getTemperature()`.
 
 ### Programmatic JSG siren playback
 
-JSG provides siren sounds as music discs. The inspected gate CC classes did not expose a direct Lua method for playing those gate sounds. A programmatic route must be separately verified before implementation.
+JSG provides siren sounds as music discs, but no direct Lua method for programmatic playback was verified in the inspected gate CC classes.
 
 ## Source of verification
 
@@ -153,6 +214,6 @@ JSG 1.20.1 source files reviewed:
 - `StargateAbstractCCMethods.java`
 - `StargateClassicCCMethods.java`
 - `StargateComputerEvents.java`
-- `StargateAbstractBaseBE.java`
+- `EnumIrisState.java`
 
 Repository: Tau-ri-Dev/Mod-JSG, branch `1.20.1`.
