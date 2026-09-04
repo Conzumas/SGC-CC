@@ -2,7 +2,7 @@
 -- Stargate Command ComputerCraft control system for JSG
 -- Target: Minecraft 1.20.1 Forge + Just Stargate Mod + CC:Tweaked
 --
--- API rule: only use JSG methods/events verified against the 1.20.1 source.
+-- Only JSG APIs verified against the 1.20.1 source are used.
 -- Temperature and direct JSG siren playback are intentionally not implemented.
 
 local CONFIG = {
@@ -14,16 +14,16 @@ local CONFIG = {
 }
 
 local state = {
+    running = true,
     gate = nil,
-    connected = false,
     gate_name = nil,
+    connected = false,
 
     gate_merged = false,
     gate_status = nil,
     gate_initiating = nil,
     gate_address = nil,
     dialed_address = nil,
-
     energy = 0,
     max_energy = 0,
 
@@ -45,16 +45,15 @@ local state = {
     ring_direction = nil,
     ring_speed = nil,
 
-    last_event = "System initialized",
     events = {},
     addresses = {},
     selected_address = 1,
     mode = "AUTO",
-
-    running = true,
-    current_screen = "MAIN",
+    last_event = "System initialized",
 }
 
+-- pcall success and JSG operation success are deliberately separate.
+-- A JSG method can return {false, code, message} without throwing.
 local function safe_call(fn, ...)
     if not fn then
         return false, nil, "missing_method", "Method is unavailable"
@@ -68,6 +67,18 @@ local function safe_call(fn, ...)
     return true, a, b, c, d
 end
 
+local function jsg_result(ok, success, code, message)
+    if not ok then
+        return false, "JSG/CC exception: " .. tostring(message)
+    end
+
+    if success ~= true then
+        return false, tostring(code or "jsg_failure") .. ": " .. tostring(message or "JSG rejected the operation")
+    end
+
+    return true, message
+end
+
 local function now()
     return os.date("%Y-%m-%d %H:%M:%S")
 end
@@ -79,8 +90,39 @@ local function trim(value)
     return value:match("^%s*(.-)%s*$") or ""
 end
 
-local function serialize(data)
-    return textutils.serialize(data)
+local function address_to_string(address)
+    if type(address) ~= "table" then
+        return "UNKNOWN"
+    end
+
+    local parts = {}
+    for i, symbol in ipairs(address) do
+        parts[i] = tostring(symbol)
+    end
+
+    return #parts > 0 and table.concat(parts, " - ") or "NONE"
+end
+
+local function same_address(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" or #a ~= #b then
+        return false
+    end
+
+    for i = 1, #a do
+        if tostring(a[i]):lower() ~= tostring(b[i]):lower() then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function normalize_symbols(raw)
+    local symbols = {}
+    for token in tostring(raw):gmatch("%S+") do
+        table.insert(symbols, token)
+    end
+    return symbols
 end
 
 local function load_table(path, fallback)
@@ -119,7 +161,7 @@ local function save_table(path, data)
         return false
     end
 
-    handle.write(serialize(data))
+    handle.write(textutils.serialize(data))
     handle.close()
     return true
 end
@@ -142,8 +184,10 @@ local function load_data()
         state.mode = data.mode
     end
 
-    if state.selected_address > #state.addresses then
-        state.selected_address = math.max(1, #state.addresses)
+    if #state.addresses == 0 then
+        state.selected_address = 1
+    else
+        state.selected_address = math.min(state.selected_address, #state.addresses)
     end
 end
 
@@ -162,67 +206,11 @@ end
 local function log_event(message)
     message = tostring(message)
     table.insert(state.events, now() .. "  " .. message)
-
     while #state.events > CONFIG.max_log_entries do
         table.remove(state.events, 1)
     end
-
     state.last_event = message
     save_events()
-end
-
-local function jsg_result(ok, success, code, message)
-    if not ok then
-        return false, "JSG/CC exception: " .. tostring(message)
-    end
-
-    if success ~= true then
-        return false, tostring(code or "jsg_failure") .. ": " .. tostring(message or "JSG rejected the operation")
-    end
-
-    return true, message
-end
-
-local function address_to_string(address)
-    if type(address) ~= "table" then
-        return "UNKNOWN"
-    end
-
-    local parts = {}
-    for i, symbol in ipairs(address) do
-        parts[i] = tostring(symbol)
-    end
-
-    if #parts == 0 then
-        return "NONE"
-    end
-
-    return table.concat(parts, " - ")
-end
-
-local function same_address(a, b)
-    if type(a) ~= "table" or type(b) ~= "table" then
-        return false
-    end
-    if #a ~= #b then
-        return false
-    end
-
-    for i = 1, #a do
-        if tostring(a[i]):lower() ~= tostring(b[i]):lower() then
-            return false
-        end
-    end
-
-    return true
-end
-
-local function normalize_symbols(raw)
-    local symbols = {}
-    for token in tostring(raw):gmatch("%S+") do
-        table.insert(symbols, token)
-    end
-    return symbols
 end
 
 local function get_symbol_map()
@@ -231,43 +219,39 @@ local function get_symbol_map()
     end
 
     local ok, symbols = safe_call(state.gate.getSymbolsMap)
-    if not ok or type(symbols) ~= "table" then
-        return nil
+    if ok and type(symbols) == "table" then
+        return symbols
     end
 
-    return symbols
+    return nil
 end
 
-local function symbol_is_valid(symbol, symbol_map)
+local function canonical_symbol(symbol, symbol_map)
     local needle = tostring(symbol):lower()
     for _, valid in ipairs(symbol_map or {}) do
         if tostring(valid):lower() == needle then
-            return true, tostring(valid)
+            return tostring(valid)
         end
     end
-    return false, symbol
+    return nil
 end
 
-local function validate_address_symbols(symbols, require_full)
-    if type(symbols) ~= "table" then
-        return false, "Address is not a table"
-    end
-
-    if #symbols < 7 or #symbols > 9 then
+local function validate_address(symbols)
+    if type(symbols) ~= "table" or #symbols < 7 or #symbols > 9 then
         return false, "Address must contain 7-9 symbols"
     end
 
     local symbol_map = get_symbol_map()
     if not symbol_map then
-        return false, "Unable to read the gate symbol map"
+        return false, "Unable to read the JSG symbol map"
     end
 
     local seen = {}
     local normalized = {}
 
     for i, symbol in ipairs(symbols) do
-        local valid, canonical = symbol_is_valid(symbol, symbol_map)
-        if not valid then
+        local canonical = canonical_symbol(symbol, symbol_map)
+        if not canonical then
             return false, "Invalid symbol at position " .. tostring(i) .. ": " .. tostring(symbol)
         end
 
@@ -278,10 +262,6 @@ local function validate_address_symbols(symbols, require_full)
 
         seen[key] = true
         normalized[i] = canonical
-    end
-
-    if require_full and #normalized ~= #symbols then
-        return false, "Address validation failed"
     end
 
     return true, normalized
@@ -303,6 +283,7 @@ local function refresh_gate()
         return false
     end
 
+    -- getGateStatus() is a multi-return Lua function, not a table.
     local ok, merged, status, initiating = safe_call(state.gate.getGateStatus)
     if not ok then
         state.gate = nil
@@ -316,37 +297,25 @@ local function refresh_gate()
     state.gate_initiating = initiating
 
     ok, state.energy = safe_call(state.gate.getEnergyStored)
-    if not ok then
-        state.energy = 0
-    end
+    if not ok then state.energy = 0 end
 
     ok, state.max_energy = safe_call(state.gate.getMaxEnergyStored)
-    if not ok then
-        state.max_energy = 0
-    end
+    if not ok then state.max_energy = 0 end
 
     ok, state.dialed_address = safe_call(state.gate.getDialedAddress)
-    if not ok then
-        state.dialed_address = nil
-    end
+    if not ok then state.dialed_address = nil end
 
     ok, state.gate_address = safe_call(state.gate.getStargateAddress)
-    if not ok then
-        state.gate_address = nil
-    end
+    if not ok then state.gate_address = nil end
 
     if state.gate.getIrisState then
         ok, state.iris_state = safe_call(state.gate.getIrisState)
-        if not ok then
-            state.iris_state = nil
-        end
+        if not ok then state.iris_state = nil end
     end
 
     if state.gate.getIrisType then
         ok, state.iris_type = safe_call(state.gate.getIrisType)
-        if not ok then
-            state.iris_type = nil
-        end
+        if not ok then state.iris_type = nil end
     end
 
     if state.gate.getIrisDurability then
@@ -393,6 +362,7 @@ local function ensure_gate()
     local gate, name = find_gate()
     if not gate then
         state.gate = nil
+        state.gate_name = nil
         state.connected = false
         return false
     end
@@ -402,16 +372,6 @@ local function ensure_gate()
     state.connected = true
     log_event("Gate connection established: " .. tostring(name))
     refresh_gate()
-
-    if CONFIG.auto_iris and state.mode == "AUTO" then
-        -- Startup/recovery is fail-closed when the gate exposes OC iris control.
-        local iris_value = tostring(state.iris_state or ""):lower()
-        if iris_value == "opened" or iris_value == "opening" then
-            -- Do not assume the command succeeded: close_iris checks JSG's result boolean.
-            return true
-        end
-    end
-
     return true
 end
 
@@ -427,27 +387,17 @@ end
 
 local function close_iris(reason)
     if not state.gate or not state.gate.toggleIris then
-        log_event("IRIS CLOSE FAILED: no supported iris control")
+        log_event("IRIS CLOSE FAILED: toggleIris() unavailable")
         return false
     end
 
     refresh_gate()
-
     if iris_is_closed() then
         return true
     end
 
-    if tostring(state.iris_type or ""):lower() == "null" then
-        log_event("IRIS CLOSE FAILED: no iris installed")
-        return false
-    end
-
-    local iris_type = tostring(state.iris_type or ""):lower()
-    if iris_type ~= "oc" then
-        log_event("IRIS CLOSE FAILED: iris mode/type is not OC")
-        return false
-    end
-
+    -- Do not compare getIrisType() to "OC" here. JSG checks iris mode
+    -- internally and returns an explicit failure if mode is not OC.
     local ok, success, code, message = safe_call(state.gate.toggleIris)
     local worked, detail = jsg_result(ok, success, code, message)
     if not worked then
@@ -461,20 +411,13 @@ end
 
 local function open_iris(reason)
     if not state.gate or not state.gate.toggleIris then
-        log_event("IRIS OPEN FAILED: no supported iris control")
+        log_event("IRIS OPEN FAILED: toggleIris() unavailable")
         return false
     end
 
     refresh_gate()
-
     if iris_is_open() then
         return true
-    end
-
-    local iris_type = tostring(state.iris_type or ""):lower()
-    if iris_type ~= "oc" then
-        log_event("IRIS OPEN FAILED: iris mode/type is not OC")
-        return false
     end
 
     local ok, success, code, message = safe_call(state.gate.toggleIris)
@@ -503,7 +446,7 @@ local function dial_saved(index)
         return
     end
 
-    local valid, symbols_or_error = validate_address_symbols(entry.symbols, true)
+    local valid, symbols_or_error = validate_address(entry.symbols)
     if not valid then
         log_event("DIAL FAILED: " .. tostring(symbols_or_error))
         return
@@ -511,27 +454,26 @@ local function dial_saved(index)
 
     local symbols = symbols_or_error
 
-    if state.dialed_address and #state.dialed_address > 0 then
+    if type(state.dialed_address) == "table" and #state.dialed_address > 0 then
         log_event("DIAL FAILED: gate already has a dialed address")
         return
     end
 
-    local energy_ok, energy_success, energy_code, energy_payload = safe_call(
+    local energy_ok, energy_success, energy_code, energy_map = safe_call(
         state.gate.getEnergyRequiredToDial,
         symbols
     )
 
     if not energy_ok then
-        log_event("DIAL PREFLIGHT FAILED: " .. tostring(energy_payload))
+        log_event("DIAL PREFLIGHT FAILED: " .. tostring(energy_map))
         return
     end
 
     if energy_success ~= true then
-        log_event("DIAL PREFLIGHT FAILED: " .. tostring(energy_code or "unknown") .. ": " .. tostring(energy_payload or "JSG rejected address"))
+        log_event("DIAL PREFLIGHT FAILED: " .. tostring(energy_code or "unknown") .. ": " .. tostring(energy_map or "JSG rejected address"))
         return
     end
 
-    local energy_map = energy_payload
     if type(energy_map) ~= "table" then
         log_event("DIAL PREFLIGHT FAILED: malformed energy response")
         return
@@ -542,6 +484,7 @@ local function dial_saved(index)
         return
     end
 
+    -- JSG explicitly supports both dialAddress(table) and dialAddress(arg1,...).
     local ok, success, code, message = safe_call(state.gate.dialAddress, symbols)
     local worked, detail = jsg_result(ok, success, code, message)
     if not worked then
@@ -554,6 +497,7 @@ local function dial_saved(index)
     state.dial_target_count = #symbols
     state.dial_last_symbol = nil
     state.incoming = false
+    state.incoming_address = nil
     state.alert = nil
 
     log_event("DIAL ACCEPTED: " .. tostring(entry.name) .. " [" .. address_to_string(symbols) .. "]")
@@ -563,19 +507,17 @@ local function add_address()
     term.clear()
     print("=== ADD ADDRESS ===")
     print("")
+
     write("Name: ")
     local name = trim(read())
-
     if name == "" then
         log_event("ADDRESS ADD CANCELLED: empty name")
         return
     end
 
     write("Symbols (7-9, separated by spaces): ")
-    local raw = read()
-    local symbols = normalize_symbols(raw)
-
-    local valid, normalized_or_error = validate_address_symbols(symbols, true)
+    local symbols = normalize_symbols(read())
+    local valid, normalized_or_error = validate_address(symbols)
     if not valid then
         log_event("ADDRESS ADD FAILED: " .. tostring(normalized_or_error))
         return
@@ -606,6 +548,7 @@ local function edit_address(index)
     term.clear()
     print("=== EDIT ADDRESS ===")
     print("Current name: " .. tostring(entry.name))
+
     write("New name (blank = keep): ")
     local name = trim(read())
     if name ~= "" then
@@ -617,7 +560,7 @@ local function edit_address(index)
     local raw = read()
     if trim(raw) ~= "" then
         local symbols = normalize_symbols(raw)
-        local valid, normalized_or_error = validate_address_symbols(symbols, true)
+        local valid, normalized_or_error = validate_address(symbols)
         if not valid then
             log_event("ADDRESS EDIT FAILED: " .. tostring(normalized_or_error))
             return
@@ -638,9 +581,8 @@ local function remove_address(index)
     term.clear()
     print("Remove address: " .. tostring(entry.name))
     write("Type YES to confirm: ")
-    local answer = trim(read())
 
-    if answer == "YES" then
+    if trim(read()) == "YES" then
         table.remove(state.addresses, index)
         state.selected_address = math.min(state.selected_address, math.max(1, #state.addresses))
         save_data()
@@ -665,12 +607,8 @@ local function handle_jsg_event(event, ...)
         end
 
     elseif event == "stargate_chevron_engaged" then
-        local source = args[1]
-        local symbol = args[2]
-        local chevron = args[3]
-        local address_size = args[4]
-
-        state.dial_chevrons = tonumber(address_size) or (tonumber(chevron) or state.dial_chevrons)
+        local source, symbol, chevron, address_size = args[1], args[2], args[3], args[4]
+        state.dial_chevrons = tonumber(address_size) or state.dial_chevrons
         state.dial_target_count = math.max(state.dial_target_count, state.dial_chevrons)
         state.dial_last_symbol = symbol
 
@@ -685,7 +623,7 @@ local function handle_jsg_event(event, ...)
         state.ring_spinning = true
         state.ring_direction = args[1]
         state.ring_speed = args[2]
-        log_event("RING SPIN START: " .. tostring(args[1] or "?") .. " @ " .. tostring(args[2] or "?") )
+        log_event("RING SPIN START: " .. tostring(args[1] or "?") .. " @ " .. tostring(args[2] or "?"))
 
     elseif event == "stargate_spin_stop" then
         state.ring_spinning = false
@@ -693,23 +631,20 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_attempt_open_failed" then
         state.dialing = false
-        log_event("GATE OPEN FAILED: " .. tostring(args[1] or "unknown") .. " / " .. tostring(args[2] or "unknown"))
+        log_event("GATE OPEN FAILED: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_attempt_close_failed" then
         log_event("GATE CLOSE FAILED: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_wormhole_open_fully" then
-        local address = args[1]
-        local initiating = args[2]
+        local address, initiating = args[1], args[2]
         state.dialing = false
         state.dialed_address = address
         state.gate_initiating = initiating
 
         if initiating == false then
             state.incoming = true
-            if type(address) == "table" then
-                state.incoming_address = address_to_string(address)
-            end
+            state.incoming_address = address_to_string(address)
         else
             state.incoming = false
             state.alert = nil
@@ -718,49 +653,46 @@ local function handle_jsg_event(event, ...)
         log_event((initiating == false and "INCOMING" or "OUTGOING") .. " WORMHOLE OPEN: " .. address_to_string(address))
 
     elseif event == "stargate_wormhole_close_fully" then
-        local address = args[1]
-        local reason = args[2]
-        local initiating = args[3]
-
+        local address, reason, initiating = args[1], args[2], args[3]
         state.dialing = false
         state.ring_spinning = false
         state.dialed_address = nil
         state.incoming = false
         state.incoming_address = nil
         state.alert = nil
-
         log_event("WORMHOLE CLOSED: " .. address_to_string(address) .. " / " .. tostring(reason or "unknown") .. " / initiating=" .. tostring(initiating))
+
+    elseif event == "stargate_wormhole_subspace_connected" then
+        log_event("WORMHOLE SUBSPACE CONNECTED: initiating=" .. tostring(args[2]))
 
     elseif event == "stargate_wormhole_subspace_disconnected" then
         log_event("WORMHOLE SUBSPACE DISCONNECTED")
 
-    elseif event == "stargate_event_horizon_traveler" then
-        local inbound = args[1]
-        local entity_type = args[2]
-        local player_name = args[4]
+    elseif event == "stargate_wormhole_incoming_message" then
+        log_event("INCOMING WORMHOLE MESSAGE RECEIVED")
 
+    elseif event == "stargate_event_horizon_traveler" then
+        local inbound, entity_type, uuid, player_name = args[1], args[2], args[3], args[4]
         if inbound == true then
-            if player_name then
-                log_event("INBOUND TRAVELER: " .. tostring(player_name) .. " (" .. tostring(entity_type) .. ")")
-            else
-                log_event("INBOUND TRAVELER: " .. tostring(entity_type or "unknown"))
-            end
+            log_event("INBOUND TRAVELER: " .. tostring(player_name or entity_type or "unknown"))
         else
             log_event("OUTBOUND TRAVELER: " .. tostring(player_name or entity_type or "unknown"))
         end
 
     elseif event == "stargate_iris_code_received" then
-        -- Never write the plaintext code to the log or screen.
+        -- Never print/store the plaintext iris code.
         log_event("GDO/IRIS CODE RECEIVED: JSG received a code")
 
     elseif event == "stargate_iris_state_changed" then
-        local old_state = args[1]
-        local new_state = args[2]
-        state.iris_state = new_state
-        log_event("IRIS STATE: " .. tostring(old_state) .. " -> " .. tostring(new_state))
+        state.iris_state = args[2]
+        log_event("IRIS STATE: " .. tostring(args[1]) .. " -> " .. tostring(args[2]))
 
     elseif event == "stargate_iris_toggled" then
         log_event("IRIS TOGGLE EVENT: close=" .. tostring(args[1]))
+
+    elseif event == "stargate_iris_type_changed" then
+        state.iris_type = args[2]
+        log_event("IRIS TYPE CHANGED: " .. tostring(args[1]) .. " -> " .. tostring(args[2]))
 
     elseif event == "stargate_iris_damaged" then
         log_event("IRIS DAMAGED: " .. tostring(args[1] or "unknown") .. " amount=" .. tostring(args[2] or "?"))
@@ -769,22 +701,17 @@ local function handle_jsg_event(event, ...)
         log_event("IRIS HIT")
 
     elseif event == "stargate_iris_destroyed" then
-        log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
         state.alert = "!!! IRIS DESTROYED !!!"
+        log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_iris_out_of_power" then
-        log_event("!!! IRIS OUT OF POWER !!!")
         state.alert = "!!! IRIS OUT OF POWER !!!"
-
-    elseif event == "stargate_iris_type_changed" then
-        state.iris_type = args[2]
-        log_event("IRIS TYPE CHANGED: " .. tostring(args[1]) .. " -> " .. tostring(args[2]))
-
-    elseif event == "stargate_attempt_open_failed" then
-        log_event("GATE OPEN ATTEMPT FAILED: " .. tostring(args[1] or "unknown"))
+        log_event("!!! IRIS OUT OF POWER !!!")
     end
 end
 
+-- This coroutine is intentionally independent of every UI/menu loop.
+-- It receives JSG events even while another coroutine is inside read() or a submenu.
 local function security_loop()
     while state.running do
         local event, p1, p2, p3, p4 = os.pullEvent()
@@ -792,7 +719,6 @@ local function security_loop()
         if event == "peripheral" or event == "peripheral_detach" then
             ensure_gate()
             refresh_gate()
-
         elseif event == "stargate_wormhole_incoming"
             or event == "stargate_chevron_engaged"
             or event == "stargate_spin_start"
@@ -801,16 +727,18 @@ local function security_loop()
             or event == "stargate_attempt_close_failed"
             or event == "stargate_wormhole_open_fully"
             or event == "stargate_wormhole_close_fully"
+            or event == "stargate_wormhole_subspace_connected"
             or event == "stargate_wormhole_subspace_disconnected"
+            or event == "stargate_wormhole_incoming_message"
             or event == "stargate_event_horizon_traveler"
             or event == "stargate_iris_code_received"
             or event == "stargate_iris_state_changed"
             or event == "stargate_iris_toggled"
+            or event == "stargate_iris_type_changed"
             or event == "stargate_iris_damaged"
             or event == "stargate_iris_hit"
             or event == "stargate_iris_destroyed"
-            or event == "stargate_iris_out_of_power"
-            or event == "stargate_iris_type_changed" then
+            or event == "stargate_iris_out_of_power" then
             handle_jsg_event(event, p1, p2, p3, p4)
         end
     end
@@ -830,13 +758,12 @@ local function energy_text()
     if not state.connected or not state.max_energy or state.max_energy <= 0 then
         return "N/A"
     end
-
-    local pct = math.floor((state.energy / state.max_energy) * 100 + 0.5)
-    return string.format("%d / %d (%d%%)", state.energy, state.max_energy, pct)
-end
-
-local function iris_text()
-    return tostring(state.iris_state or "UNKNOWN"):upper()
+    return string.format(
+        "%d / %d (%d%%)",
+        state.energy,
+        state.max_energy,
+        math.floor((state.energy / state.max_energy) * 100 + 0.5)
+    )
 end
 
 local function clear_line(y)
@@ -848,11 +775,9 @@ local function header(title)
     clear_line(1)
     term.setCursorPos(1, 1)
     term.write("S T A R G A T E   C O M M A N D")
-
     clear_line(2)
     term.setCursorPos(1, 2)
     term.write("================================")
-
     clear_line(3)
     term.setCursorPos(1, 3)
     term.write("[ " .. tostring(title) .. " ]")
@@ -867,24 +792,21 @@ local function draw_main()
     term.setCursorPos(2, 6)
     term.write("ENERGY: " .. energy_text())
     term.setCursorPos(2, 7)
-    term.write("IRIS:   " .. iris_text() .. "  [" .. state.mode .. "]")
+    term.write("IRIS:   " .. tostring(state.iris_state or "UNKNOWN"):upper() .. "  [" .. state.mode .. "]")
 
     term.setCursorPos(2, 9)
     term.write("LOCAL ADDRESS:")
     term.setCursorPos(4, 10)
-    term.write(address_to_string(nil))
-
+    local local_address = "UNKNOWN"
     if type(state.gate_address) == "table" then
-        local first_key = nil
-        for key in pairs(state.gate_address) do
-            first_key = key
-            break
-        end
-        if first_key and type(state.gate_address[first_key]) == "table" then
-            term.setCursorPos(4, 10)
-            term.write(address_to_string(state.gate_address[first_key]):sub(1, 74))
+        for _, address in pairs(state.gate_address) do
+            if type(address) == "table" then
+                local_address = address_to_string(address)
+                break
+            end
         end
     end
+    term.write(local_address:sub(1, 74))
 
     term.setCursorPos(2, 12)
     term.write("DIALED ADDRESS:")
@@ -923,8 +845,8 @@ local function draw_main()
     term.setCursorPos(2, 25)
     term.write("Q SHUTDOWN")
 
+    term.setCursorPos(38, 20)
     if state.alert then
-        term.setCursorPos(38, 20)
         term.write(tostring(state.alert):sub(1, 38))
     end
 
@@ -946,14 +868,14 @@ local function draw_addresses()
 
         for i = first, last do
             local entry = state.addresses[i]
-            local marker = (i == state.selected_address) and ">" or " "
+            local marker = i == state.selected_address and ">" or " "
             term.setCursorPos(2, row)
             term.write(string.format(
                 "%s %02d %-18s %s",
                 marker,
                 i,
                 tostring(entry.name):sub(1, 18),
-                address_to_string(entry.symbols):sub(1, 28)
+                address_to_string(entry.symbols):sub(1, 30)
             ))
             row = row + 1
         end
@@ -967,72 +889,13 @@ local function draw_addresses()
     term.write("E EDIT   ESC BACK")
 end
 
-local function draw_iris()
-    term.clear()
-    header("IRIS CONTROL")
-
-    term.setCursorPos(2, 5)
-    term.write("STATE: " .. iris_text())
-    term.setCursorPos(2, 6)
-    term.write("TYPE:  " .. tostring(state.iris_type or "UNKNOWN"))
-
-    term.setCursorPos(2, 7)
-    term.write("MODE:  " .. state.mode)
-
-    if state.iris_durability_display then
-        term.setCursorPos(2, 8)
-        term.write("DURABILITY: " .. tostring(state.iris_durability_display))
-    end
-
-    if state.iris_durability and state.iris_max_durability then
-        term.setCursorPos(2, 9)
-        term.write("CURRENT/MAX: " .. tostring(state.iris_durability) .. " / " .. tostring(state.iris_max_durability))
-    end
-
-    term.setCursorPos(2, 12)
-    term.write("O OPEN")
-    term.setCursorPos(2, 13)
-    term.write("C CLOSE")
-    term.setCursorPos(2, 14)
-    term.write("A TOGGLE AUTO/MANUAL")
-    term.setCursorPos(2, 15)
-    term.write("ESC BACK")
-
-    term.setCursorPos(2, 18)
-    term.write("AUTO closes the iris on incoming activation.")
-    term.setCursorPos(2, 19)
-    term.write("JSG remains responsible for native GDO/iris-code processing.")
-end
-
-local function draw_log()
-    term.clear()
-    header("EVENT LOG")
-
-    local start = math.max(1, #state.events - 19)
-    local row = 5
-
-    for i = start, #state.events do
-        term.setCursorPos(2, row)
-        term.write(tostring(state.events[i]):sub(1, 76))
-        row = row + 1
-        if row > 24 then
-            break
-        end
-    end
-
-    term.setCursorPos(2, 26)
-    term.write("ESC BACK")
-end
-
 local function address_menu()
     while state.running do
         draw_addresses()
-        local event, key = os.pullEvent("key")
+        local _, key = os.pullEvent("key")
 
         if key == keys.up then
-            if #state.addresses > 0 then
-                state.selected_address = math.max(1, state.selected_address - 1)
-            end
+            state.selected_address = math.max(1, state.selected_address - 1)
         elseif key == keys.down then
             if #state.addresses > 0 then
                 state.selected_address = math.min(#state.addresses, state.selected_address + 1)
@@ -1051,11 +914,44 @@ local function address_menu()
     end
 end
 
+local function draw_iris()
+    term.clear()
+    header("IRIS CONTROL")
+
+    term.setCursorPos(2, 5)
+    term.write("STATE: " .. tostring(state.iris_state or "UNKNOWN"):upper())
+    term.setCursorPos(2, 6)
+    term.write("TYPE:  " .. tostring(state.iris_type or "UNKNOWN"):upper())
+    term.setCursorPos(2, 7)
+    term.write("MODE:  " .. state.mode)
+
+    term.setCursorPos(2, 8)
+    term.write("DURABILITY: " .. tostring(state.iris_durability_display or "UNKNOWN"))
+    if state.iris_durability and state.iris_max_durability then
+        term.setCursorPos(2, 9)
+        term.write("CURRENT/MAX: " .. tostring(state.iris_durability) .. " / " .. tostring(state.iris_max_durability))
+    end
+
+    term.setCursorPos(2, 12)
+    term.write("O OPEN")
+    term.setCursorPos(2, 13)
+    term.write("C CLOSE")
+    term.setCursorPos(2, 14)
+    term.write("A TOGGLE AUTO/MANUAL")
+    term.setCursorPos(2, 15)
+    term.write("ESC BACK")
+
+    term.setCursorPos(2, 18)
+    term.write("AUTO closes the iris on incoming activation.")
+    term.setCursorPos(2, 19)
+    term.write("JSG handles native GDO/iris-code validation.")
+end
+
 local function iris_menu()
     while state.running do
         refresh_gate()
         draw_iris()
-        local event, key = os.pullEvent("key")
+        local _, key = os.pullEvent("key")
 
         if key == keys.o then
             if state.mode == "MANUAL" then
@@ -1066,26 +962,39 @@ local function iris_menu()
         elseif key == keys.c then
             close_iris("manual control")
         elseif key == keys.a then
-            if state.mode == "AUTO" then
-                state.mode = "MANUAL"
-            else
-                state.mode = "AUTO"
-                if state.incoming then
-                    close_iris("AUTO mode enabled during incoming activation")
-                end
-            end
+            state.mode = state.mode == "AUTO" and "MANUAL" or "AUTO"
             save_data()
             log_event("IRIS MODE: " .. state.mode)
+            if state.mode == "AUTO" and state.incoming then
+                close_iris("AUTO enabled during incoming activation")
+            end
         elseif key == keys.esc then
             return
         end
     end
 end
 
+local function draw_log()
+    term.clear()
+    header("EVENT LOG")
+
+    local start = math.max(1, #state.events - 19)
+    local row = 5
+    for i = start, #state.events do
+        term.setCursorPos(2, row)
+        term.write(tostring(state.events[i]):sub(1, 76))
+        row = row + 1
+        if row > 24 then break end
+    end
+
+    term.setCursorPos(2, 26)
+    term.write("ESC BACK")
+end
+
 local function log_menu()
     while state.running do
         draw_log()
-        local event, key = os.pullEvent("key")
+        local _, key = os.pullEvent("key")
         if key == keys.esc then
             return
         end
@@ -1096,31 +1005,35 @@ local function refresh_loop()
     while state.running do
         ensure_gate()
         refresh_gate()
+
+        -- Recovery is also fail-closed once the peripheral is found again.
+        if CONFIG.auto_iris and state.mode == "AUTO" and state.gate and iris_is_open() then
+            close_iris("peripheral recovery")
+        end
+
         sleep(CONFIG.refresh_interval)
     end
 end
 
 local function ui_loop()
     while state.running do
-        state.current_screen = "MAIN"
         draw_main()
-
-        local event, key = os.pullEvent("key")
+        local _, key = os.pullEvent("key")
 
         if key == keys.one then
-            state.current_screen = "ADDRESS"
             address_menu()
         elseif key == keys.two then
             dial_saved(state.selected_address)
         elseif key == keys.three then
-            state.current_screen = "IRIS"
             iris_menu()
         elseif key == keys.four then
-            state.current_screen = "LOG"
             log_menu()
         elseif key == keys.five then
             ensure_gate()
             refresh_gate()
+            if CONFIG.auto_iris and state.mode == "AUTO" and iris_is_open() then
+                close_iris("manual refresh fail-closed")
+            end
             log_event("MANUAL REFRESH")
         elseif key == keys.q then
             state.running = false
@@ -1140,10 +1053,8 @@ local function startup()
         refresh_gate()
         log_event("Gate status at startup: " .. status_text())
 
-        if CONFIG.auto_iris and state.mode == "AUTO" then
-            if iris_is_open() then
-                close_iris("startup fail-closed")
-            end
+        if CONFIG.auto_iris and state.mode == "AUTO" and iris_is_open() then
+            close_iris("startup fail-closed")
         end
     else
         log_event("NO STARGATE PERIPHERAL FOUND")
@@ -1153,7 +1064,6 @@ end
 startup()
 parallel.waitForAny(security_loop, refresh_loop, ui_loop)
 state.running = false
-
 save_data()
 save_events()
 term.clear()
