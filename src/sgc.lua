@@ -10,6 +10,8 @@
 --   * Security/event handling runs independently of the UI.
 --   * Temperature and direct JSG siren playback are not implemented.
 
+local release_iris_lock
+
 local CONFIG = {
     data_file = "sgc_data",
     event_log_file = "sgc_events",
@@ -380,7 +382,7 @@ local function iris_bucket()
     return "unknown"
 end
 
-local function release_iris_lock()
+release_iris_lock = function()
     state.iris_toggle_pending = false
     state.iris_pending_token = nil
     state.iris_pending_direction = nil
