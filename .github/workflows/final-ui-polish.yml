@@ -1,0 +1,40 @@
+name: Final SGC UI polish
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor == 'Conzumas' || github.actor == 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/sgc.lua')
+          source = path.read_text(encoding='utf-8')
+          old = '        local first_row = 8\n        local footer_rows = 3\n'
+          new = '        local first_row = 7\n        local footer_rows = 3\n'
+          if old not in source:
+              raise SystemExit('address-details layout marker not found')
+          path.write_text(source.replace(old, new, 1), encoding='utf-8')
+          PY
+      - name: Commit final source and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/final-ui-polish.yml
+          git add src/sgc.lua
+          git commit -m "Fit complete address glyph details on standard terminal"
+          git push origin HEAD:main
