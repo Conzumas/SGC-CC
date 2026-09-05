@@ -1,0 +1,35 @@
+name: Fix menu back key
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/sgc.lua'
+      - '.github/workflows/fix-back-key.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Replace ESC menu navigation with B
+        run: |
+          sed -i 's/keys\.esc/keys.b/g; s/ESC BACK/B BACK/g' src/sgc.lua
+          git diff -- src/sgc.lua
+
+      - name: Commit and push
+        run: |
+          if git diff --quiet -- src/sgc.lua; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/sgc.lua
+          git commit -m 'Fix submenu back key'
+          git push origin HEAD:main
