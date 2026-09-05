@@ -1285,7 +1285,7 @@ local function address_details_menu()
         term.write("GLYPHS: " .. tostring(#entry.symbols) .. "   POSITION / MAP INDEX / JSG NAME")
 
         local width, height = term.getSize()
-        local first_row = 8
+        local first_row = 7
         local footer_rows = 3
         local last_row = math.max(first_row, height - footer_rows - 1)
         local visible = math.max(1, last_row - first_row + 1)
