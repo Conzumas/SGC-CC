@@ -46,7 +46,7 @@ local function draw_symbols(display, symbols)
     local width, height = display.getSize()
     local columns = 3
     local column_width = math.floor(width / columns)
-    local rows = height - 5
+    local rows = height - 6
     local capacity = columns * rows
 
     display.clear()
