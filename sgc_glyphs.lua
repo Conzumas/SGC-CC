@@ -1,9 +1,9 @@
 -- SGC-CC Glyph Reference
 -- Lists the exact symbol names exposed by the connected JSG stargate.
 --
--- If a monitor is attached, the glyph table is rendered there while
--- keyboard input remains on the computer. Otherwise the computer terminal
--- is used directly.
+-- When a monitor is attached, the complete reference is rendered once and
+-- the program exits so the computer remains available for other programs.
+-- Without a monitor, the reference is shown on the computer terminal.
 
 local function find_gate()
     local gate = peripheral.find("stargate")
@@ -39,11 +39,13 @@ local function get_symbols(gate)
     return symbols
 end
 
-local function draw_symbols(display, symbols, input_term)
+local function draw_symbols(display, symbols)
     local previous = term.redirect(display)
+
     if display.setTextScale then
         display.setTextScale(0.5)
     end
+
     display.clear()
     display.setCursorPos(1, 1)
     display.write("S T A R G A T E   G L Y P H   R E F E R E N C E")
@@ -53,49 +55,31 @@ local function draw_symbols(display, symbols, input_term)
     display.write("CODE = JSG symbol-map index")
 
     local width, height = display.getSize()
-    local columns = width >= 60 and 3 or 2
-    local rows = math.max(1, height - 6)
-    local per_page = columns * rows
-    local pages = math.max(1, math.ceil(#symbols / per_page))
-    local page = 1
+    local columns = 3
+    local column_width = math.floor(width / columns)
+    local rows = math.max(1, height - 5)
+    local capacity = columns * rows
 
-    while true do
-        display.setCursorPos(1, 5)
-        display.clearLine()
-        display.write(string.format("PAGE %d / %d    %d SYMBOLS", page, pages, #symbols))
+    display.setCursorPos(1, 5)
+    display.clearLine()
+    display.write(string.format("%d SYMBOLS   3 COLUMNS   %d AVAILABLE SLOTS", #symbols, capacity))
 
-        local column_width = math.floor(width / columns)
-        for row = 0, rows - 1 do
-            for column = 0, columns - 1 do
-                local index = (page - 1) * per_page + row + column * rows + 1
-                local symbol = symbols[index]
-                local x = 2 + column * column_width
-                local y = 6 + row
+    for index, symbol in ipairs(symbols) do
+        local zero = index - 1
+        local column = math.floor(zero / rows)
+        local row = zero % rows
 
-                display.setCursorPos(x, y)
-                display.clearLine()
-                if symbol then
-                    local text = string.format("[%02d] %s", index, tostring(symbol))
-                    display.write(text:sub(1, column_width - 2))
-                end
-            end
-        end
-
-        display.setCursorPos(2, height - 1)
-        display.clearLine()
-        display.write("LEFT/RIGHT PAGE   B BACK")
-
-        term.redirect(input_term)
-        local _, key = os.pullEvent("key")
-        term.redirect(display)
-
-        if key == keys.left then
-            page = math.max(1, page - 1)
-        elseif key == keys.right then
-            page = math.min(pages, page + 1)
-        elseif key == keys.b then
+        if column >= columns then
             break
         end
+
+        local x = 2 + column * column_width
+        local y = 6 + row
+        local text = string.format("[%02d] %s", index, tostring(symbol))
+
+        display.setCursorPos(x, y)
+        display.clearLine()
+        display.write(text:sub(1, column_width - 2))
     end
 
     term.redirect(previous)
@@ -113,8 +97,6 @@ if not symbols then
     return
 end
 
-local input_term = term.current()
 local monitor = find_monitor()
-local display = monitor or input_term
-
-draw_symbols(display, symbols, input_term)
+local display = monitor or term.current()
+draw_symbols(display, symbols)
