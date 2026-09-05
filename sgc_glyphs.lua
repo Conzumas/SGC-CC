@@ -41,7 +41,9 @@ end
 
 local function draw_symbols(display, symbols, input_term)
     local previous = term.redirect(display)
-    display.setTextScale(0.5)
+    if display.setTextScale then
+        display.setTextScale(0.5)
+    end
     display.clear()
     display.setCursorPos(1, 1)
     display.write("S T A R G A T E   G L Y P H   R E F E R E N C E")
