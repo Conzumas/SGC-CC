@@ -1,11 +1,11 @@
 -- SGC-CC Glyph Reference
--- One-page JSG symbol reference for a dedicated monitor computer.
+-- JSG symbol reference for a dedicated monitor computer.
 --
 -- Deployment:
 --   * Run this program on a SECOND ComputerCraft computer.
 --   * Connect that computer to the same wired modem network as the JSG gate.
 --   * Connect a complete 3x3 monitor (or larger) to the second computer.
---   * The program draws the reference once and exits.
+--   * Use LEFT/RIGHT to change pages and B or Q to exit.
 
 local function find_gate()
     local gate = peripheral.find("stargate")
@@ -36,7 +36,7 @@ local function get_symbols(gate)
     return symbols
 end
 
-local function draw_symbols(display, symbols)
+local function draw_symbols(display, symbols, page)
     local previous = term.redirect(display)
 
     if display.setTextScale then
@@ -45,9 +45,15 @@ local function draw_symbols(display, symbols)
 
     local width, height = display.getSize()
     local columns = 3
-    local column_width = math.floor(width / columns)
-    local rows = height - 6
-    local capacity = columns * rows
+    local first_row = 6
+    local footer_rows = 3
+    local rows = math.max(1, math.min(13, height - first_row - footer_rows + 1))
+    local column_width = math.max(1, math.floor(width / columns))
+    local per_page = rows * columns
+    local pages = math.max(1, math.ceil(#symbols / per_page))
+
+    page = math.max(1, math.min(page, pages))
+    local page_first = (page - 1) * per_page + 1
 
     display.clear()
     display.setCursorPos(1, 1)
@@ -56,38 +62,35 @@ local function draw_symbols(display, symbols)
     display.write("================================================")
     display.setCursorPos(1, 3)
     display.write("CODE = JSG SYMBOL-MAP INDEX")
+    display.setCursorPos(1, 4)
+    display.write(string.format("PAGE %d / %d    %d SYMBOLS    %d COLUMNS", page, pages, #symbols, columns))
 
-    display.setCursorPos(1, 5)
-    display.clearLine()
-    display.write(string.format("%d SYMBOLS   3 COLUMNS   %d DISPLAY SLOTS", #symbols, capacity))
+    for local_index = 0, per_page - 1 do
+        local index = page_first + local_index
+        if index > #symbols then
+            break
+        end
 
-    if #symbols > capacity then
-        display.setCursorPos(1, 6)
-        display.clearLine()
-        display.write("MONITOR TOO SMALL: 3x3 OR LARGER REQUIRED")
-        term.redirect(previous)
-        return false
-    end
-
-    for index, symbol in ipairs(symbols) do
-        local zero = index - 1
-        local column = math.floor(zero / rows)
-        local row = zero % rows
+        local column = math.floor(local_index / rows)
+        local row = local_index % rows
         local x = 2 + column * column_width
-        local y = 6 + row
-        local text = string.format("[%02d] %s", index, tostring(symbol))
+        local y = first_row + row
+        local symbol = tostring(symbols[index])
+        local text = string.format("[%02d] %s", index, symbol)
 
         display.setCursorPos(x, y)
-        display.clearLine()
-        display.write(text:sub(1, column_width - 2))
+        display.write(text:sub(1, math.max(1, column_width - 2)))
     end
 
+    display.setCursorPos(1, height - 2)
+    display.write("LEFT/RIGHT PAGE    B/Q EXIT")
+    display.setCursorPos(1, height - 1)
+    display.write("INDEX = JSG MAP INDEX    EVERY GLYPH IS SHOWN")
     display.setCursorPos(1, height)
-    display.clearLine()
     display.write("SGC-CC | DEDICATED GLYPH REFERENCE")
 
     term.redirect(previous)
-    return true
+    return pages
 end
 
 local gate = find_gate()
@@ -108,4 +111,18 @@ if not monitor then
     return
 end
 
-draw_symbols(monitor, symbols)
+local page = 1
+while true do
+    local pages = draw_symbols(monitor, symbols, page)
+    local _, key = os.pullEvent("key")
+
+    if key == keys.left then
+        page = math.max(1, page - 1)
+    elseif key == keys.right then
+        page = math.min(pages, page + 1)
+    elseif key == keys.b or key == keys.q then
+        break
+    end
+end
+
+term.redirect(term.native())
