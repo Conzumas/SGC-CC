@@ -10,6 +10,7 @@
 --   * Security/event handling runs independently of the UI.
 
 local release_iris_lock
+local header
 
 local CONFIG = {
     data_file = "sgc_data",
@@ -835,6 +836,10 @@ local function set_alarm_audio(kind, reason)
         return
     end
 
+    if kind == "outgoing" and state.audio_alarm == "incoming" then
+        return
+    end
+
     local drive = audio_drive_for_alarm(kind)
     if not drive then
         return
@@ -1236,7 +1241,7 @@ local function clear_line(y)
     term.clearLine()
 end
 
-local function header(title)
+header = function(title)
     clear_line(1)
     term.setCursorPos(1, 1)
     term.write("S T A R G A T E   C O M M A N D")
