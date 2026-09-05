@@ -1,9 +1,11 @@
 -- SGC-CC Glyph Reference
--- Lists the exact symbol names exposed by the connected JSG stargate.
+-- One-page JSG symbol reference for a dedicated monitor computer.
 --
--- When a monitor is attached, the complete reference is rendered once and
--- the program exits so the computer remains available for other programs.
--- Without a monitor, the reference is shown on the computer terminal.
+-- Deployment:
+--   * Run this program on a SECOND ComputerCraft computer.
+--   * Connect that computer to the same wired modem network as the JSG gate.
+--   * Connect a complete 3x3 monitor (or larger) to the second computer.
+--   * The program draws the reference once and exits.
 
 local function find_gate()
     local gate = peripheral.find("stargate")
@@ -22,12 +24,7 @@ local function find_gate()
 end
 
 local function find_monitor()
-    local monitor = peripheral.find("monitor")
-    if monitor then
-        return monitor
-    end
-
-    return nil
+    return peripheral.find("monitor")
 end
 
 local function get_symbols(gate)
@@ -46,33 +43,36 @@ local function draw_symbols(display, symbols)
         display.setTextScale(0.5)
     end
 
+    local width, height = display.getSize()
+    local columns = 3
+    local column_width = math.floor(width / columns)
+    local rows = height - 5
+    local capacity = columns * rows
+
     display.clear()
     display.setCursorPos(1, 1)
     display.write("S T A R G A T E   G L Y P H   R E F E R E N C E")
     display.setCursorPos(1, 2)
     display.write("================================================")
     display.setCursorPos(1, 3)
-    display.write("CODE = JSG symbol-map index")
-
-    local width, height = display.getSize()
-    local columns = 3
-    local column_width = math.floor(width / columns)
-    local rows = math.max(1, height - 5)
-    local capacity = columns * rows
+    display.write("CODE = JSG SYMBOL-MAP INDEX")
 
     display.setCursorPos(1, 5)
     display.clearLine()
-    display.write(string.format("%d SYMBOLS   3 COLUMNS   %d AVAILABLE SLOTS", #symbols, capacity))
+    display.write(string.format("%d SYMBOLS   3 COLUMNS   %d DISPLAY SLOTS", #symbols, capacity))
+
+    if #symbols > capacity then
+        display.setCursorPos(1, 6)
+        display.clearLine()
+        display.write("MONITOR TOO SMALL: 3x3 OR LARGER REQUIRED")
+        term.redirect(previous)
+        return false
+    end
 
     for index, symbol in ipairs(symbols) do
         local zero = index - 1
         local column = math.floor(zero / rows)
         local row = zero % rows
-
-        if column >= columns then
-            break
-        end
-
         local x = 2 + column * column_width
         local y = 6 + row
         local text = string.format("[%02d] %s", index, tostring(symbol))
@@ -82,7 +82,12 @@ local function draw_symbols(display, symbols)
         display.write(text:sub(1, column_width - 2))
     end
 
+    display.setCursorPos(1, height)
+    display.clearLine()
+    display.write("SGC-CC | DEDICATED GLYPH REFERENCE")
+
     term.redirect(previous)
+    return true
 end
 
 local gate = find_gate()
@@ -98,5 +103,9 @@ if not symbols then
 end
 
 local monitor = find_monitor()
-local display = monitor or term.current()
-draw_symbols(display, symbols)
+if not monitor then
+    print("No monitor found. Connect a complete 3x3 monitor or larger.")
+    return
+end
+
+draw_symbols(monitor, symbols)
