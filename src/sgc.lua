@@ -1094,7 +1094,7 @@ local function draw_addresses()
     term.setCursorPos(2, 23)
     term.write("D DIAL   A ADD   R REMOVE")
     term.setCursorPos(2, 24)
-    term.write("E EDIT   ESC BACK")
+    term.write("E EDIT   B BACK")
 end
 
 local function address_menu()
@@ -1116,7 +1116,7 @@ local function address_menu()
             edit_address(state.selected_address)
         elseif key == keys.r then
             remove_address(state.selected_address)
-        elseif key == keys.esc then
+        elseif key == keys.b then
             return
         end
     end
@@ -1157,7 +1157,7 @@ local function draw_iris()
     term.setCursorPos(2, 16)
     term.write("F FORCE-CLEAR STUCK SOFTWARE LOCK")
     term.setCursorPos(2, 17)
-    term.write("ESC BACK")
+    term.write("B BACK")
 
     term.setCursorPos(2, 20)
     term.write("JSG handles native GDO/iris-code validation.")
@@ -1220,7 +1220,7 @@ local function iris_menu()
                 log_event("FORCE CLEAR REFUSED: no iris toggle lock is active")
             end
 
-        elseif key == keys.esc then
+        elseif key == keys.b then
             return
         end
     end
@@ -1240,14 +1240,14 @@ local function draw_log()
     end
 
     term.setCursorPos(2, 26)
-    term.write("ESC BACK")
+    term.write("B BACK")
 end
 
 local function log_menu()
     while state.running do
         draw_log()
         local _, key = os.pullEvent("key")
-        if key == keys.esc then
+        if key == keys.b then
             return
         end
     end
