@@ -22,6 +22,10 @@ local CONFIG = {
         outgoing_repeat_seconds = 1.5,
         poll_interval = 0.05,
     },
+
+    -- Iris telemetry stays live for a short period after a hit so the
+    -- monitor remains visibly in an active/alarm state after an impact.
+    iris_attack_hold_ms = 5000,
 }
 
 local state = {
@@ -37,12 +41,22 @@ local state = {
     dialed_address = nil,
     energy = 0,
     max_energy = 0,
+    jsg_version = nil,
+    gate_type = nil,
+    symbol_type = nil,
 
     iris_state = nil,
     iris_type = nil,
     iris_durability_display = nil,
     iris_durability = nil,
     iris_max_durability = nil,
+    iris_last_state_change = nil,
+    iris_last_state_change_at = nil,
+    iris_hit_count = 0,
+    iris_damage_total = 0,
+    iris_last_damage = nil,
+    iris_last_hit_at = nil,
+    iris_attack_active = false,
 
     incoming = false,
     incoming_address = nil,
@@ -218,7 +232,7 @@ local function log_event(message)
 end
 
 -----------------------------------------------------------------------
--- UI helpers needed by the glyph picker
+-- UI helpers
 -----------------------------------------------------------------------
 
 local function clear_line(y)
@@ -238,6 +252,29 @@ local function header(title)
     term.write("[ " .. tostring(title) .. " ]")
 end
 
+local function draw_controls(lines)
+    local width, height = term.getSize()
+    local start = math.max(1, height - #lines + 1)
+
+    for i, line in ipairs(lines) do
+        local y = start + i - 1
+        if y <= height then
+            clear_line(y)
+            term.setCursorPos(2, y)
+            term.write(tostring(line):sub(1, math.max(0, width - 2)))
+        end
+    end
+end
+
+local function remaining_time_text(epoch_ms)
+    if not epoch_ms then
+        return "UNKNOWN"
+    end
+
+    local delta = math.max(0, os.epoch("utc") - epoch_ms)
+    return string.format("%0.1fs AGO", delta / 1000)
+end
+
 -----------------------------------------------------------------------
 -- Gate discovery / monitoring state
 -----------------------------------------------------------------------
@@ -251,6 +288,9 @@ local function clear_gate_state()
     state.dialed_address = nil
     state.energy = 0
     state.max_energy = 0
+    state.jsg_version = nil
+    state.gate_type = nil
+    state.symbol_type = nil
     state.iris_state = nil
     state.iris_type = nil
     state.iris_durability_display = nil
@@ -338,6 +378,21 @@ local function refresh_gate()
         state.max_energy = 0
     end
 
+    ok, state.jsg_version = safe_call(state.gate.getJSGVersion)
+    if not ok then
+        state.jsg_version = nil
+    end
+
+    ok, state.gate_type = safe_call(state.gate.getGateType)
+    if not ok then
+        state.gate_type = nil
+    end
+
+    ok, state.symbol_type = safe_call(state.gate.getSymbolType)
+    if not ok then
+        state.symbol_type = nil
+    end
+
     ok, state.dialed_address = safe_call(state.gate.getDialedAddress)
     if not ok then
         state.dialed_address = nil
@@ -353,6 +408,8 @@ local function refresh_gate()
         if not ok then
             state.iris_state = nil
         end
+    else
+        state.iris_state = nil
     end
 
     if state.gate.getIrisType then
@@ -360,6 +417,8 @@ local function refresh_gate()
         if not ok then
             state.iris_type = nil
         end
+    else
+        state.iris_type = nil
     end
 
     if state.gate.getIrisDurability then
@@ -373,6 +432,16 @@ local function refresh_gate()
             state.iris_durability = nil
             state.iris_max_durability = nil
         end
+    else
+        state.iris_durability_display = nil
+        state.iris_durability = nil
+        state.iris_max_durability = nil
+    end
+
+    if state.iris_last_hit_at then
+        state.iris_attack_active = (os.epoch("utc") - state.iris_last_hit_at) <= CONFIG.iris_attack_hold_ms
+    else
+        state.iris_attack_active = false
     end
 
     return true
@@ -397,13 +466,13 @@ end
 
 local function canonical_symbol(symbol, symbol_map)
     local needle = tostring(symbol):lower()
-    for _, valid in ipairs(symbol_map or {}) do
+    for index, valid in ipairs(symbol_map or {}) do
         if tostring(valid):lower() == needle then
-            return tostring(valid)
+            return tostring(valid), index
         end
     end
 
-    return nil
+    return nil, nil
 end
 
 local function validate_address(symbols)
@@ -459,6 +528,7 @@ local function glyph_picker(initial_symbols)
     end
 
     local cursor = 1
+    local timer = os.startTimer(CONFIG.refresh_interval)
 
     while true do
         local width, height = term.getSize()
@@ -496,70 +566,78 @@ local function glyph_picker(initial_symbols)
             term.write(text:sub(1, math.max(1, column_width - 2)))
         end
 
-        term.setCursorPos(2, height - 2)
-        term.clearLine()
-        term.write("ARROWS MOVE   SPACE SELECT   ENTER ACCEPT   B CANCEL")
-        term.setCursorPos(2, height - 1)
-        term.clearLine()
-        term.write("7-9 GLYPHS REQUIRED   * = SELECTED")
+        draw_controls({
+            "ARROWS MOVE   SPACE SELECT   ENTER ACCEPT   B CANCEL",
+            "7-9 GLYPHS REQUIRED   * = SELECTED   INDEX = JSG MAP INDEX",
+        })
 
-        local _, key = os.pullEvent("key")
+        local event, p1 = os.pullEvent()
 
-        if key == keys.up then
-            cursor = cursor == 1 and #symbols or cursor - 1
+        if event == "key" then
+            local key = p1
 
-        elseif key == keys.down then
-            cursor = cursor == #symbols and 1 or cursor + 1
+            if key == keys.up then
+                cursor = cursor == 1 and #symbols or cursor - 1
 
-        elseif key == keys.left then
-            local target = cursor - rows
-            if target >= 1 then
-                cursor = target
-            end
+            elseif key == keys.down then
+                cursor = cursor == #symbols and 1 or cursor + 1
 
-        elseif key == keys.right then
-            local target = cursor + rows
-            if target <= #symbols then
-                cursor = target
-            end
-
-        elseif key == keys.space then
-            local symbol = symbols[cursor]
-            local key_name = tostring(symbol):lower()
-
-            if selected[key_name] then
-                selected[key_name] = nil
-                selected_count = selected_count - 1
-                for i, value in ipairs(order) do
-                    if tostring(value):lower() == key_name then
-                        table.remove(order, i)
-                        break
-                    end
+            elseif key == keys.left then
+                local target = cursor - rows
+                if target >= 1 then
+                    cursor = target
                 end
-            elseif selected_count < 9 then
-                selected[key_name] = true
-                selected_count = selected_count + 1
-                table.insert(order, tostring(symbol))
+
+            elseif key == keys.right then
+                local target = cursor + rows
+                if target <= #symbols then
+                    cursor = target
+                end
+
+            elseif key == keys.space then
+                local symbol = symbols[cursor]
+                local key_name = tostring(symbol):lower()
+
+                if selected[key_name] then
+                    selected[key_name] = nil
+                    selected_count = selected_count - 1
+                    for i, value in ipairs(order) do
+                        if tostring(value):lower() == key_name then
+                            table.remove(order, i)
+                            break
+                        end
+                    end
+                elseif selected_count < 9 then
+                    selected[key_name] = true
+                    selected_count = selected_count + 1
+                    table.insert(order, tostring(symbol))
+                end
+
+            elseif key == keys.enter then
+                if selected_count < 7 then
+                    log_event("GLYPH PICKER: " .. tostring(selected_count) .. " selected; 7 minimum required")
+                else
+                    pcall(os.cancelTimer, timer)
+                    return order
+                end
+
+            elseif key == keys.b then
+                pcall(os.cancelTimer, timer)
+                return nil
             end
 
-        elseif key == keys.enter then
-            if selected_count < 7 then
-                log_event("GLYPH PICKER: " .. tostring(selected_count) .. " selected; 7 minimum required")
-            else
-                return order
-            end
-
-        elseif key == keys.b then
-            return nil
+        elseif event == "timer" and p1 == timer then
+            timer = os.startTimer(CONFIG.refresh_interval)
         end
     end
 end
 
 local function add_address()
     term.clear()
-    print("=== ADD ADDRESS ===")
-    print("")
-
+    header("ADD ADDRESS")
+    term.setCursorPos(2, 5)
+    term.write("ENTER THE DESTINATION NAME")
+    term.setCursorPos(2, 7)
     write("Name: ")
     local name = trim(read())
     if name == "" then
@@ -602,18 +680,19 @@ local function edit_address(index)
     end
 
     term.clear()
-    print("=== EDIT ADDRESS ===")
-    print("Current name: " .. tostring(entry.name))
-    print("Current symbols: " .. address_to_string(entry.symbols))
-    print("")
-
+    header("EDIT ADDRESS")
+    term.setCursorPos(2, 5)
+    term.write("CURRENT NAME: " .. tostring(entry.name))
+    term.setCursorPos(2, 6)
+    term.write("CURRENT GLYPHS: " .. address_to_string(entry.symbols):sub(1, 58))
+    term.setCursorPos(2, 8)
     write("New name (blank = keep): ")
     local name = trim(read())
     if name ~= "" then
         entry.name = name
     end
 
-    write("Edit symbols? (Y/N): ")
+    write("Edit glyphs? (Y/N): ")
     local choice = trim(read()):upper()
     if choice == "Y" then
         local symbols = glyph_picker(entry.symbols)
@@ -642,7 +721,10 @@ local function remove_address(index)
     end
 
     term.clear()
-    print("Remove address: " .. tostring(entry.name))
+    header("REMOVE ADDRESS")
+    term.setCursorPos(2, 5)
+    term.write("REMOVE: " .. tostring(entry.name))
+    term.setCursorPos(2, 7)
     write("Type YES to confirm: ")
 
     if trim(read()) == "YES" then
@@ -965,6 +1047,8 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_iris_state_changed" then
         state.iris_state = args[2]
+        state.iris_last_state_change = tostring(args[2] or "UNKNOWN")
+        state.iris_last_state_change_at = os.epoch("utc")
         log_event("IRIS STATE: " .. tostring(args[1]) .. " -> " .. tostring(args[2]))
 
     elseif event == "stargate_iris_toggled" then
@@ -975,14 +1059,27 @@ local function handle_jsg_event(event, ...)
         log_event("IRIS TYPE CHANGED: " .. tostring(args[1]) .. " -> " .. tostring(args[2]))
 
     elseif event == "stargate_iris_damaged" then
-        log_event("IRIS DAMAGED: " .. tostring(args[1] or "unknown") .. " amount=" .. tostring(args[2] or "?"))
+        local source = args[1]
+        local damage = tonumber(args[2])
+        state.iris_attack_active = true
+        state.iris_last_hit_at = os.epoch("utc")
+        if damage then
+            state.iris_last_damage = damage
+            state.iris_damage_total = state.iris_damage_total + damage
+        end
+        log_event("IRIS DAMAGED: " .. tostring(source or "unknown") .. " amount=" .. tostring(args[2] or "?"))
 
     elseif event == "stargate_iris_hit" then
+        state.iris_hit_count = state.iris_hit_count + 1
+        state.iris_attack_active = true
+        state.iris_last_hit_at = os.epoch("utc")
         log_event("IRIS HIT")
 
     elseif event == "stargate_iris_destroyed" then
         state.alert = "!!! IRIS DESTROYED !!!"
         state.iris_state = nil
+        state.iris_attack_active = true
+        state.iris_last_hit_at = os.epoch("utc")
         log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_iris_out_of_power" then
@@ -1066,6 +1163,19 @@ local function energy_text()
     )
 end
 
+local function local_address_text()
+    local local_address = "UNKNOWN"
+    if type(state.gate_address) == "table" then
+        for _, address in pairs(state.gate_address) do
+            if type(address) == "table" then
+                local_address = address_to_string(address)
+                break
+            end
+        end
+    end
+    return local_address
+end
+
 local function draw_main()
     term.clear()
     header("MAIN CONTROL")
@@ -1080,16 +1190,7 @@ local function draw_main()
     term.setCursorPos(2, 9)
     term.write("LOCAL ADDRESS:")
     term.setCursorPos(4, 10)
-    local local_address = "UNKNOWN"
-    if type(state.gate_address) == "table" then
-        for _, address in pairs(state.gate_address) do
-            if type(address) == "table" then
-                local_address = address_to_string(address)
-                break
-            end
-        end
-    end
-    term.write(local_address:sub(1, 74))
+    term.write(local_address_text():sub(1, 74))
 
     term.setCursorPos(2, 12)
     term.write("DIALED ADDRESS:")
@@ -1115,26 +1216,20 @@ local function draw_main()
         term.write("RING SPINNING: " .. tostring(state.ring_direction or "?") .. " @ " .. tostring(state.ring_speed or "?"))
     end
 
-    term.setCursorPos(2, 20)
-    term.write("1  ADDRESS BOOK")
-    term.setCursorPos(2, 21)
-    term.write("2  DIAL SELECTED")
-    term.setCursorPos(2, 22)
-    term.write("3  IRIS MONITOR")
-    term.setCursorPos(2, 23)
-    term.write("4  EVENT LOG")
-    term.setCursorPos(2, 24)
-    term.write("5  REFRESH")
-    term.setCursorPos(2, 25)
-    term.write("Q  SHUTDOWN")
-
     if state.alert then
-        term.setCursorPos(38, 20)
-        term.write(tostring(state.alert):sub(1, 38))
+        term.setCursorPos(2, 19)
+        term.write("ALERT: " .. tostring(state.alert):sub(1, 65))
     end
 
-    term.setCursorPos(2, 27)
+    local _, height = term.getSize()
+    local last_y = math.max(21, height - 3)
+    term.setCursorPos(2, last_y)
     term.write("LAST: " .. tostring(state.last_event):sub(1, 74))
+
+    draw_controls({
+        "1 ADDRESS BOOK   2 DIAL SELECTED   3 IRIS MONITOR",
+        "4 EVENT LOG      5 REFRESH         Q SHUTDOWN",
+    })
 end
 
 local function draw_addresses()
@@ -1145,103 +1240,205 @@ local function draw_addresses()
         term.setCursorPos(2, 5)
         term.write("NO SAVED ADDRESSES")
     else
-        local first = math.max(1, state.selected_address - 8)
-        local last = math.min(#state.addresses, first + 14)
-        local row = 5
+        local _, height = term.getSize()
+        local footer_rows = 2
+        local first_row = 5
+        local last_row = math.max(first_row, height - footer_rows - 1)
+        local visible = math.max(1, last_row - first_row + 1)
+        local first = math.max(1, state.selected_address - math.floor(visible / 2))
+        local last = math.min(#state.addresses, first + visible - 1)
+        first = math.max(1, last - visible + 1)
 
+        local row = first_row
         for i = first, last do
             local entry = state.addresses[i]
             local marker = i == state.selected_address and ">" or " "
+            local name = tostring(entry.name):sub(1, 18)
+            local glyphs = address_to_string(entry.symbols):sub(1, math.max(1, math.min(30, math.floor(term.getSize() / 3))))
             term.setCursorPos(2, row)
-            term.write(string.format(
-                "%s %02d %-18s %s",
-                marker,
-                i,
-                tostring(entry.name):sub(1, 18),
-                address_to_string(entry.symbols):sub(1, 30)
-            ))
+            term.write(string.format("%s %02d %-18s %s", marker, i, name, glyphs))
             row = row + 1
         end
     end
 
-    term.setCursorPos(2, 22)
-    term.write("UP/DOWN SELECT")
-    term.setCursorPos(2, 23)
-    term.write("D DIAL   A ADD   R REMOVE")
-    term.setCursorPos(2, 24)
-    term.write("E EDIT   B BACK")
+    draw_controls({
+        "UP/DOWN SELECT   V VIEW GLYPHS   D DIAL",
+        "A ADD   E EDIT   R REMOVE   B BACK",
+    })
 end
 
 local function address_menu()
+    local timer = os.startTimer(CONFIG.refresh_interval)
+
     while state.running do
         draw_addresses()
-        local _, key = os.pullEvent("key")
+        local event, p1 = os.pullEvent()
 
-        if key == keys.up then
-            state.selected_address = math.max(1, state.selected_address - 1)
-        elseif key == keys.down then
-            if #state.addresses > 0 then
-                state.selected_address = math.min(#state.addresses, state.selected_address + 1)
+        if event == "key" then
+            local key = p1
+
+            if key == keys.up then
+                state.selected_address = math.max(1, state.selected_address - 1)
+            elseif key == keys.down then
+                if #state.addresses > 0 then
+                    state.selected_address = math.min(#state.addresses, state.selected_address + 1)
+                end
+            elseif key == keys.d then
+                dial_saved(state.selected_address)
+            elseif key == keys.a then
+                add_address()
+            elseif key == keys.e then
+                edit_address(state.selected_address)
+            elseif key == keys.r then
+                remove_address(state.selected_address)
+            elseif key == keys.v then
+                if state.addresses[state.selected_address] then
+                    local result = nil
+                    result = true
+                    while result do
+                        term.clear()
+                        header("ADDRESS DETAILS")
+                        local entry = state.addresses[state.selected_address]
+                        term.setCursorPos(2, 5)
+                        term.write("NAME: " .. tostring(entry.name):sub(1, 70))
+                        term.setCursorPos(2, 6)
+                        term.write("SYMBOL COUNT: " .. tostring(#entry.symbols))
+                        term.setCursorPos(2, 7)
+                        term.write("GLYPH REFERENCE: POSITION / JSG MAP INDEX / JSG NAME")
+
+                        local _, h = term.getSize()
+                        local footer_rows = 2
+                        local first_row = 9
+                        local last_row = math.max(first_row, h - footer_rows - 1)
+                        local visible = math.max(1, last_row - first_row + 1)
+
+                        for pos = 1, math.min(#entry.symbols, visible) do
+                            local symbol, map_index = canonical_symbol(entry.symbols[pos], get_symbol_map() or {})
+                            symbol = symbol or tostring(entry.symbols[pos])
+                            term.setCursorPos(2, first_row + pos - 1)
+                            term.write(string.format("%02d  MAP[%02d]  %s", pos, tonumber(map_index) or 0, symbol):sub(1, math.max(1, term.getSize() - 2)))
+                        end
+
+                        term.setCursorPos(2, math.max(first_row, h - footer_rows - 2))
+                        term.write("This JSG name/index pairing lets the visual glyph be matched to a written address.")
+                        draw_controls({
+                            "D DIAL   E EDIT   R REMOVE",
+                            "B BACK",
+                        })
+
+                        local detail_event, detail_key = os.pullEvent("key")
+                        if detail_event ~= "key" then
+                            break
+                        end
+
+                        if detail_key == keys.d then
+                            dial_saved(state.selected_address)
+                        elseif detail_key == keys.e then
+                            edit_address(state.selected_address)
+                        elseif detail_key == keys.r then
+                            remove_address(state.selected_address)
+                        elseif detail_key == keys.b then
+                            result = nil
+                        end
+                    end
+                end
+            elseif key == keys.b then
+                pcall(os.cancelTimer, timer)
+                return
             end
-        elseif key == keys.d then
-            dial_saved(state.selected_address)
-        elseif key == keys.a then
-            add_address()
-        elseif key == keys.e then
-            edit_address(state.selected_address)
-        elseif key == keys.r then
-            remove_address(state.selected_address)
-        elseif key == keys.b then
-            return
+
+        elseif event == "timer" and p1 == timer then
+            timer = os.startTimer(CONFIG.refresh_interval)
         end
     end
 end
 
 local function draw_iris_monitor()
     term.clear()
-    header("IRIS MONITOR")
+    header("IRIS CONTROL / TELEMETRY")
 
-    term.setCursorPos(2, 5)
-    term.write("STATE:      " .. tostring(state.iris_state or "UNKNOWN"):upper())
-    term.setCursorPos(2, 6)
-    term.write("TYPE:       " .. tostring(state.iris_type or "UNKNOWN"):upper())
-    term.setCursorPos(2, 7)
-    term.write("DURABILITY: " .. tostring(state.iris_durability_display or "UNKNOWN"))
+    local iris_state = tostring(state.iris_state or "UNKNOWN"):upper()
+    local iris_type = tostring(state.iris_type or "UNKNOWN"):upper()
+    local attack = state.iris_attack_active and "DETECTED" or "NONE"
+    local thermal = "NOT EXPOSED BY JSG CC API"
+    local durability = tostring(state.iris_durability_display or "UNKNOWN")
+    local current_max = "UNKNOWN"
+    local percent = "UNKNOWN"
 
     if state.iris_durability and state.iris_max_durability then
-        term.setCursorPos(2, 8)
-        term.write("CURRENT/MAX: " .. tostring(state.iris_durability) .. " / " .. tostring(state.iris_max_durability))
+        current_max = tostring(state.iris_durability) .. " / " .. tostring(state.iris_max_durability)
+        if tonumber(state.iris_max_durability) and tonumber(state.iris_max_durability) > 0 then
+            percent = string.format("%d%%", math.floor((state.iris_durability / state.iris_max_durability) * 100 + 0.5))
+        end
     end
 
-    term.setCursorPos(2, 10)
-    term.write("CONTROL: JSG / GDO")
+    term.setCursorPos(2, 5)
+    term.write("CONTROL LINK: ONLINE     AUTHORITY: JSG / GDO")
+    term.setCursorPos(2, 6)
+    term.write("IRIS STATE:   " .. iris_state)
+    term.setCursorPos(2, 7)
+    term.write("IRIS TYPE:    " .. iris_type)
+    term.setCursorPos(2, 8)
+    term.write("DURABILITY:   " .. durability)
+    term.setCursorPos(2, 9)
+    term.write("CURRENT/MAX:  " .. current_max .. "    " .. percent)
+
     term.setCursorPos(2, 11)
-    term.write("SGC does not command the iris.")
+    term.write("STATE CHANGE: " .. tostring(state.iris_last_state_change or "NONE"))
     term.setCursorPos(2, 12)
-    term.write("JSG handles iris-code validation and mechanics.")
+    term.write("LAST CHANGE:  " .. remaining_time_text(state.iris_last_state_change_at))
 
-    if state.alert then
-        term.setCursorPos(2, 14)
-        term.write(tostring(state.alert):sub(1, 74))
-    end
+    term.setCursorPos(2, 14)
+    term.write("ATTACK MONITOR: " .. attack)
+    term.setCursorPos(2, 15)
+    term.write("IRIS HITS:     " .. tostring(state.iris_hit_count))
+    term.setCursorPos(2, 16)
+    term.write("DAMAGE TOTAL:  " .. tostring(state.iris_damage_total))
+    term.setCursorPos(2, 17)
+    term.write("LAST DAMAGE:   " .. tostring(state.iris_last_damage or "NONE"))
+    term.setCursorPos(2, 18)
+    term.write("LAST HIT:      " .. remaining_time_text(state.iris_last_hit_at))
 
     term.setCursorPos(2, 20)
-    term.write("R REFRESH")
+    term.write("THERMAL STATUS: " .. thermal)
     term.setCursorPos(2, 21)
-    term.write("B BACK")
+    term.write("BEAM/HIT DATA: JSG iris hit + damage events monitored")
+
+    term.setCursorPos(2, 23)
+    term.write("JSG: " .. tostring(state.jsg_version or "UNKNOWN") .. "   GATE: " .. tostring(state.gate_type or "UNKNOWN"))
+    term.setCursorPos(2, 24)
+    term.write("SYMBOL TYPE: " .. tostring(state.symbol_type or "UNKNOWN"))
+
+    if state.alert then
+        term.setCursorPos(2, 26)
+        term.write("ALERT: " .. tostring(state.alert):sub(1, 65))
+    end
+
+    draw_controls({
+        "R FORCE REFRESH   B BACK",
+        "LIVE TELEMETRY: AUTO-REFRESH   SGC MONITORS / JSG CONTROLS",
+    })
 end
 
 local function iris_monitor_menu()
+    local timer = os.startTimer(CONFIG.refresh_interval)
+
     while state.running do
         refresh_gate()
         draw_iris_monitor()
-        local _, key = os.pullEvent("key")
+        local event, p1 = os.pullEvent()
 
-        if key == keys.r then
+        if event == "key" then
+            if p1 == keys.r then
+                refresh_gate()
+                log_event("IRIS MONITOR REFRESH")
+            elseif p1 == keys.b then
+                pcall(os.cancelTimer, timer)
+                return
+            end
+        elseif event == "timer" and p1 == timer then
             refresh_gate()
-            log_event("IRIS MONITOR REFRESH")
-        elseif key == keys.b then
-            return
+            timer = os.startTimer(CONFIG.refresh_interval)
         end
     end
 end
@@ -1250,48 +1447,69 @@ local function draw_log()
     term.clear()
     header("EVENT LOG")
 
-    local start = math.max(1, #state.events - 19)
-    local row = 5
+    local _, height = term.getSize()
+    local footer_rows = 1
+    local first_row = 5
+    local last_row = math.max(first_row, height - footer_rows - 1)
+    local visible = math.max(1, last_row - first_row + 1)
+    local start = math.max(1, #state.events - visible + 1)
+    local row = first_row
+
     for i = start, #state.events do
         term.setCursorPos(2, row)
-        term.write(tostring(state.events[i]):sub(1, 76))
+        term.write(tostring(state.events[i]):sub(1, math.max(1, term.getSize() - 2)))
         row = row + 1
-        if row > 24 then break end
+        if row > last_row then
+            break
+        end
     end
 
-    term.setCursorPos(2, 26)
-    term.write("B BACK")
+    draw_controls({
+        "B BACK",
+    })
 end
 
 local function log_menu()
+    local timer = os.startTimer(CONFIG.refresh_interval)
+
     while state.running do
         draw_log()
-        local _, key = os.pullEvent("key")
-        if key == keys.b then
+        local event, p1 = os.pullEvent()
+        if event == "key" and p1 == keys.b then
+            pcall(os.cancelTimer, timer)
             return
+        elseif event == "timer" and p1 == timer then
+            timer = os.startTimer(CONFIG.refresh_interval)
         end
     end
 end
 
 local function ui_loop()
+    local timer = os.startTimer(CONFIG.refresh_interval)
+
     while state.running do
         draw_main()
-        local _, key = os.pullEvent("key")
+        local event, p1 = os.pullEvent()
 
-        if key == keys.one then
-            address_menu()
-        elseif key == keys.two then
-            dial_saved(state.selected_address)
-        elseif key == keys.three then
-            iris_monitor_menu()
-        elseif key == keys.four then
-            log_menu()
-        elseif key == keys.five then
-            ensure_gate()
-            refresh_gate()
-            log_event("MANUAL REFRESH")
-        elseif key == keys.q then
-            state.running = false
+        if event == "key" then
+            if p1 == keys.one then
+                address_menu()
+            elseif p1 == keys.two then
+                dial_saved(state.selected_address)
+            elseif p1 == keys.three then
+                iris_monitor_menu()
+            elseif p1 == keys.four then
+                log_menu()
+            elseif p1 == keys.five then
+                ensure_gate()
+                refresh_gate()
+                log_event("MANUAL REFRESH")
+            elseif p1 == keys.q then
+                state.running = false
+            end
+
+        elseif event == "timer" and p1 == timer then
+            timer = os.startTimer(CONFIG.refresh_interval)
         end
     end
 end
