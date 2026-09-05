@@ -8,7 +8,6 @@
 --   * The iris toggle lock is acquired before any yielding call.
 --   * Unknown/transitional iris states are never blindly toggled.
 --   * Security/event handling runs independently of the UI.
---   * Temperature and direct JSG siren playback are not implemented.
 
 local release_iris_lock
 
@@ -19,6 +18,18 @@ local CONFIG = {
     refresh_interval = 0.5,
     iris_lock_timeout = 15,
     auto_iris = true,
+
+    -- Disk alarms. CC:Tweaked provides playAudio/stopAudio for records,
+    -- but no record-playback-complete event. These values therefore represent
+    -- the measured burst length of each alarm in seconds and are used only
+    -- to decide when the next replay may begin.
+    audio = {
+        incoming_drive = "drive_3",
+        outgoing_drive = "drive_2",
+        incoming_repeat_seconds = 3.0,
+        outgoing_repeat_seconds = 3.0,
+        poll_interval = 0.05,
+    },
 }
 
 local state = {
@@ -57,6 +68,11 @@ local state = {
     ring_direction = nil,
     ring_speed = nil,
 
+    audio_alarm = nil,
+    audio_alarm_since = nil,
+    audio_last_drive = nil,
+    audio_error_reported = {},
+
     events = {},
     addresses = {},
     selected_address = 1,
@@ -68,8 +84,6 @@ local state = {
 -- Generic helpers
 -----------------------------------------------------------------------
 
--- JSG methods commonly return {success, code, message...} without throwing.
--- Some methods (notably engageSymbol with a bad symbol) may also throw.
 local function safe_call(fn, ...)
     if not fn then
         return false, nil, "missing_method", "Method is unavailable"
@@ -135,14 +149,6 @@ local function same_address(a, b)
     end
 
     return true
-end
-
-local function normalize_symbols(raw)
-    local symbols = {}
-    for token in tostring(raw):gmatch("%S+") do
-        table.insert(symbols, token)
-    end
-    return symbols
 end
 
 local function load_table(path, fallback)
@@ -288,8 +294,6 @@ local function ensure_gate()
     end
 
     if old_gate ~= nil and gate ~= old_gate then
-        -- A pending call may still be suspended against the old peripheral.
-        -- Invalidate that reservation before replacing the gate object.
         release_iris_lock()
         log_event("Gate peripheral changed; invalidated pending iris toggle")
     end
@@ -312,7 +316,6 @@ local function refresh_gate()
         return false
     end
 
-    -- getGateStatus() is multiple Lua return values.
     local ok, merged, status, initiating = safe_call(state.gate.getGateStatus)
     if not ok then
         state.gate = nil
@@ -327,25 +330,37 @@ local function refresh_gate()
     state.gate_initiating = initiating
 
     ok, state.energy = safe_call(state.gate.getEnergyStored)
-    if not ok then state.energy = 0 end
+    if not ok then
+        state.energy = 0
+    end
 
     ok, state.max_energy = safe_call(state.gate.getMaxEnergyStored)
-    if not ok then state.max_energy = 0 end
+    if not ok then
+        state.max_energy = 0
+    end
 
     ok, state.dialed_address = safe_call(state.gate.getDialedAddress)
-    if not ok then state.dialed_address = nil end
+    if not ok then
+        state.dialed_address = nil
+    end
 
     ok, state.gate_address = safe_call(state.gate.getStargateAddress)
-    if not ok then state.gate_address = nil end
+    if not ok then
+        state.gate_address = nil
+    end
 
     if state.gate.getIrisState then
         ok, state.iris_state = safe_call(state.gate.getIrisState)
-        if not ok then state.iris_state = nil end
+        if not ok then
+            state.iris_state = nil
+        end
     end
 
     if state.gate.getIrisType then
         ok, state.iris_type = safe_call(state.gate.getIrisType)
-        if not ok then state.iris_type = nil end
+        if not ok then
+            state.iris_type = nil
+        end
     end
 
     if state.gate.getIrisDurability then
@@ -402,9 +417,6 @@ local function maybe_release_iris_lock()
     end
 end
 
--- This is the ONLY function in the program allowed to call toggleIris().
--- The lock is acquired before refresh_gate(), because every peripheral call
--- below can yield and sibling coroutines can run during that wait.
 local function toggle_iris(direction, reason)
     direction = tostring(direction):upper()
     if direction ~= "OPEN" and direction ~= "CLOSE" then
@@ -421,7 +433,6 @@ local function toggle_iris(direction, reason)
         return false
     end
 
-    -- Acquire BEFORE the first yield.
     local token = {}
     state.iris_toggle_pending = true
     state.iris_pending_token = token
@@ -480,8 +491,6 @@ local function toggle_iris(direction, reason)
 
     local ok, success, code, message = safe_call(state.gate.toggleIris)
 
-    -- The call above may yield. A FORCE, peripheral reconnect, or iris
-    -- destruction may have invalidated this reservation while it was parked.
     if state.iris_pending_token ~= token then
         log_event("IRIS " .. direction .. " STALE COMPLETION IGNORED")
         return false
@@ -495,7 +504,6 @@ local function toggle_iris(direction, reason)
         return false
     end
 
-    -- JSG accepted the toggle. The physical state is now expected to transition.
     state.iris_state = direction == "CLOSE" and "CLOSING" or "OPENING"
     log_event("IRIS " .. direction .. " ACCEPTED: " .. tostring(reason or "operator"))
     return true
@@ -533,6 +541,7 @@ local function canonical_symbol(symbol, symbol_map)
             return tostring(valid)
         end
     end
+
     return nil
 end
 
@@ -567,6 +576,129 @@ local function validate_address(symbols)
     return true, normalized
 end
 
+-- Interactive selector used by Address Book. It always starts from a fresh
+-- getSymbolsMap() result and returns canonical symbol strings in selection
+-- order. The caller runs validate_address() again before storing them.
+local function glyph_picker(initial_symbols)
+    local symbols = get_symbol_map()
+    if not symbols or #symbols == 0 then
+        log_event("GLYPH PICKER FAILED: unable to read the JSG symbol map")
+        return nil
+    end
+
+    local selected = {}
+    local order = {}
+    local selected_count = 0
+
+    for _, symbol in ipairs(initial_symbols or {}) do
+        local canonical = canonical_symbol(symbol, symbols)
+        local key = canonical and canonical:lower() or nil
+        if canonical and not selected[key] then
+            selected[key] = true
+            table.insert(order, canonical)
+            selected_count = selected_count + 1
+        end
+    end
+
+    local cursor = 1
+
+    while true do
+        local width, height = term.getSize()
+        local columns = width >= 60 and 3 or 2
+        local column_width = math.max(1, math.floor(width / columns))
+        local rows = math.max(1, height - 8)
+        local per_page = rows * columns
+        local pages = math.max(1, math.ceil(#symbols / per_page))
+        local page = math.floor((cursor - 1) / per_page) + 1
+        local page_first = (page - 1) * per_page + 1
+
+        term.clear()
+        header("SELECT GLYPHS")
+        term.setCursorPos(2, 5)
+        term.write(string.format("SELECTED: %d / 9    PAGE %d / %d", selected_count, page, pages))
+
+        for local_index = 0, per_page - 1 do
+            local index = page_first + local_index
+            if index > #symbols then
+                break
+            end
+
+            local column = math.floor(local_index / rows)
+            local row = local_index % rows
+            local x = 2 + column * column_width
+            local y = 6 + row
+            local symbol = symbols[index]
+            local key_name = tostring(symbol):lower()
+            local marker = selected[key_name] and "*" or " "
+            local cursor_marker = cursor == index and ">" or " "
+            local text = string.format("%s%s [%02d] %s", cursor_marker, marker, index, tostring(symbol))
+
+            term.setCursorPos(x, y)
+            term.clearLine()
+            term.write(text:sub(1, math.max(1, column_width - 2)))
+        end
+
+        term.setCursorPos(2, height - 2)
+        term.clearLine()
+        term.write("ARROWS MOVE   SPACE SELECT   ENTER ACCEPT   B CANCEL")
+        term.setCursorPos(2, height - 1)
+        term.clearLine()
+        term.write("7-9 GLYPHS REQUIRED   * = SELECTED")
+
+        local _, key = os.pullEvent("key")
+
+        if key == keys.up then
+            cursor = cursor == 1 and #symbols or cursor - 1
+
+        elseif key == keys.down then
+            cursor = cursor == #symbols and 1 or cursor + 1
+
+        elseif key == keys.left then
+            local target = cursor - rows
+            if target < 1 then
+                target = cursor
+            else
+                cursor = target
+            end
+
+        elseif key == keys.right then
+            local target = cursor + rows
+            if target <= #symbols then
+                cursor = target
+            end
+
+        elseif key == keys.space then
+            local symbol = symbols[cursor]
+            local key_name = tostring(symbol):lower()
+
+            if selected[key_name] then
+                selected[key_name] = nil
+                selected_count = selected_count - 1
+                for i, value in ipairs(order) do
+                    if tostring(value):lower() == key_name then
+                        table.remove(order, i)
+                        break
+                    end
+                end
+            elseif selected_count < 9 then
+                selected[key_name] = true
+                selected_count = selected_count + 1
+                table.insert(order, tostring(symbol))
+            end
+
+        elseif key == keys.enter then
+            if selected_count < 7 then
+                log_event("GLYPH PICKER: " .. tostring(selected_count) .. " selected; 7 minimum required")
+            else
+                return order
+            end
+
+        elseif key == keys.b then
+            return nil
+        end
+    end
+end
+
 local function add_address()
     term.clear()
     print("=== ADD ADDRESS ===")
@@ -579,8 +711,12 @@ local function add_address()
         return
     end
 
-    write("Symbols (7-9, separated by spaces): ")
-    local symbols = normalize_symbols(read())
+    local symbols = glyph_picker()
+    if not symbols then
+        log_event("ADDRESS ADD CANCELLED")
+        return
+    end
+
     local valid, normalized_or_error = validate_address(symbols)
     if not valid then
         log_event("ADDRESS ADD FAILED: " .. tostring(normalized_or_error))
@@ -605,7 +741,9 @@ end
 
 local function edit_address(index)
     local entry = state.addresses[index]
-    if not entry then return end
+    if not entry then
+        return
+    end
 
     term.clear()
     print("=== EDIT ADDRESS ===")
@@ -619,15 +757,21 @@ local function edit_address(index)
         entry.name = name
     end
 
-    write("New symbols (blank = keep): ")
-    local raw = read()
-    if trim(raw) ~= "" then
-        local symbols = normalize_symbols(raw)
+    write("Edit symbols? (Y/N): ")
+    local choice = trim(read()):upper()
+    if choice == "Y" then
+        local symbols = glyph_picker(entry.symbols)
+        if not symbols then
+            log_event("ADDRESS EDIT CANCELLED")
+            return
+        end
+
         local valid, normalized_or_error = validate_address(symbols)
         if not valid then
             log_event("ADDRESS EDIT FAILED: " .. tostring(normalized_or_error))
             return
         end
+
         entry.symbols = normalized_or_error
     end
 
@@ -637,7 +781,9 @@ end
 
 local function remove_address(index)
     local entry = state.addresses[index]
-    if not entry then return end
+    if not entry then
+        return
+    end
 
     term.clear()
     print("Remove address: " .. tostring(entry.name))
@@ -650,6 +796,116 @@ local function remove_address(index)
         log_event("ADDRESS REMOVED: " .. tostring(entry.name))
     else
         log_event("ADDRESS REMOVE CANCELLED")
+    end
+end
+
+-----------------------------------------------------------------------
+-- Audio manager
+-----------------------------------------------------------------------
+
+local function audio_drive_for_alarm(kind)
+    if kind == "incoming" then
+        return CONFIG.audio.incoming_drive
+    elseif kind == "outgoing" then
+        return CONFIG.audio.outgoing_drive
+    end
+
+    return nil
+end
+
+local function audio_repeat_seconds(kind)
+    if kind == "incoming" then
+        return CONFIG.audio.incoming_repeat_seconds
+    elseif kind == "outgoing" then
+        return CONFIG.audio.outgoing_repeat_seconds
+    end
+
+    return nil
+end
+
+local function stop_alarm_audio()
+    for _, drive in ipairs({ CONFIG.audio.incoming_drive, CONFIG.audio.outgoing_drive }) do
+        pcall(disk.stopAudio, drive)
+    end
+
+    state.audio_alarm = nil
+    state.audio_alarm_since = nil
+    state.audio_last_drive = nil
+end
+
+local function set_alarm_audio(kind, reason)
+    if kind ~= "incoming" and kind ~= "outgoing" then
+        stop_alarm_audio()
+        return
+    end
+
+    local drive = audio_drive_for_alarm(kind)
+    if not drive then
+        return
+    end
+
+    if state.audio_alarm == kind and state.audio_last_drive == drive then
+        return
+    end
+
+    for _, other in ipairs({ CONFIG.audio.incoming_drive, CONFIG.audio.outgoing_drive }) do
+        if other ~= drive then
+            pcall(disk.stopAudio, other)
+        end
+    end
+
+    state.audio_alarm = kind
+    state.audio_alarm_since = nil
+    state.audio_last_drive = drive
+    log_event("AUDIO ALARM: " .. kind:upper() .. " / " .. tostring(reason or "event"))
+end
+
+local function audio_play_once(kind)
+    local drive = audio_drive_for_alarm(kind)
+    if not drive then
+        return false
+    end
+
+    local ok_has, has_audio = pcall(disk.hasAudio, drive)
+    if not ok_has or has_audio ~= true then
+        local message = "AUDIO " .. kind:upper() .. " FAILED: " .. tostring(drive) .. " has no music disc"
+        if not state.audio_error_reported[drive] then
+            state.audio_error_reported[drive] = true
+            log_event(message)
+        end
+        return false
+    end
+
+    state.audio_error_reported[drive] = nil
+
+    local ok_play, result = pcall(disk.playAudio, drive)
+    if not ok_play then
+        if not state.audio_error_reported[drive .. ":play"] then
+            state.audio_error_reported[drive .. ":play"] = true
+            log_event("AUDIO " .. kind:upper() .. " FAILED: " .. tostring(result))
+        end
+        return false
+    end
+
+    state.audio_error_reported[drive .. ":play"] = nil
+    state.audio_alarm_since = os.epoch("utc")
+    return true
+end
+
+local function audio_loop()
+    while state.running do
+        if state.audio_alarm then
+            local repeat_seconds = audio_repeat_seconds(state.audio_alarm)
+            local elapsed = state.audio_alarm_since and (os.epoch("utc") - state.audio_alarm_since) / 1000 or nil
+
+            if not state.audio_alarm_since then
+                audio_play_once(state.audio_alarm)
+            elseif repeat_seconds and elapsed >= repeat_seconds then
+                audio_play_once(state.audio_alarm)
+            end
+        end
+
+        sleep(CONFIG.audio.poll_interval)
     end
 end
 
@@ -714,7 +970,6 @@ local function dial_saved(index)
         return
     end
 
-    -- JSG explicitly supports both a table argument and individual arguments.
     local ok, success, code, message = safe_call(state.gate.dialAddress, symbols)
     local worked, detail = jsg_result(ok, success, code, message)
     if not worked then
@@ -729,6 +984,7 @@ local function dial_saved(index)
     state.incoming = false
     state.incoming_address = nil
     state.alert = nil
+    set_alarm_audio("outgoing", "dial accepted")
 
     log_event("DIAL ACCEPTED: " .. tostring(entry.name) .. " [" .. address_to_string(symbols) .. "]")
 end
@@ -745,6 +1001,7 @@ local function handle_jsg_event(event, ...)
         state.incoming = true
         state.incoming_address = "INCOMING DIAL (" .. tostring(address_size or "?") .. " SYMBOLS)"
         state.alert = "!!! INCOMING WORMHOLE !!!"
+        set_alarm_audio("incoming", "incoming wormhole")
         log_event("INCOMING WORMHOLE DETECTED: " .. tostring(address_size or "unknown") .. " symbols")
 
         if CONFIG.auto_iris and state.mode == "AUTO" then
@@ -770,6 +1027,7 @@ local function handle_jsg_event(event, ...)
         if source == "INCOMING_WORMHOLE" then
             state.incoming = true
             state.alert = "!!! INCOMING WORMHOLE !!!"
+            set_alarm_audio("incoming", "incoming chevron")
         end
 
         log_event("CHEVRON " .. tostring(chevron or "?") .. " ENGAGED: " .. tostring(symbol or "?") .. " [" .. tostring(source or "?") .. "]")
@@ -788,6 +1046,7 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_attempt_open_failed" then
         state.dialing = false
+        stop_alarm_audio()
         log_event("GATE OPEN FAILED: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_attempt_close_failed" then
@@ -802,9 +1061,13 @@ local function handle_jsg_event(event, ...)
         if initiating == false then
             state.incoming = true
             state.incoming_address = address_to_string(address)
+            set_alarm_audio("incoming", "incoming wormhole open")
         else
             state.incoming = false
             state.alert = nil
+            if state.audio_alarm ~= "incoming" then
+                set_alarm_audio("outgoing", "outgoing wormhole open")
+            end
         end
 
         log_event((initiating == false and "INCOMING" or "OUTGOING") .. " WORMHOLE OPEN: " .. address_to_string(address))
@@ -817,6 +1080,7 @@ local function handle_jsg_event(event, ...)
         state.incoming = false
         state.incoming_address = nil
         state.alert = nil
+        stop_alarm_audio()
         log_event("WORMHOLE CLOSED: " .. address_to_string(address) .. " / " .. tostring(reason or "unknown") .. " / initiating=" .. tostring(initiating))
 
     elseif event == "stargate_wormhole_subspace_connected" then
@@ -837,7 +1101,6 @@ local function handle_jsg_event(event, ...)
         end
 
     elseif event == "stargate_iris_code_received" then
-        -- Do not expose or store the plaintext code. JSG handles validation.
         log_event("GDO/IRIS CODE RECEIVED: JSG received a code")
 
     elseif event == "stargate_iris_state_changed" then
@@ -860,16 +1123,13 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_iris_destroyed" then
         state.alert = "!!! IRIS DESTROYED !!!"
-        log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
-        -- The physical iris no longer exists, so a software toggle reservation
-        -- cannot remain meaningful.
         state.iris_state = nil
         release_iris_lock()
+        log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_iris_out_of_power" then
         state.alert = "!!! IRIS OUT OF POWER !!!"
         log_event("!!! IRIS OUT OF POWER !!!")
-
     end
 end
 
@@ -877,8 +1137,6 @@ end
 -- Background loops
 -----------------------------------------------------------------------
 
--- This loop is independent from every UI/menu loop. It therefore continues
--- receiving JSG events while the operator is in read(), address_menu(), etc.
 local function security_loop()
     while state.running do
         local event, p1, p2, p3, p4 = os.pullEvent()
@@ -926,22 +1184,15 @@ local function refresh_loop()
         if state.iris_toggle_pending and state.iris_pending_since then
             local elapsed = os.epoch("utc") - state.iris_pending_since
             if elapsed >= CONFIG.iris_lock_timeout * 1000 then
-                if not state.alert or state.alert ~= "IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED" then
+                if state.alert ~= "IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED" then
                     state.alert = "IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED"
                     log_event("!!! IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED !!!")
                 end
             end
         end
 
-        -- AUTO recovery only attempts a close when the current physical state
-        -- is positively known to be OPEN. Unknown/transition states refuse.
-        if CONFIG.auto_iris and state.mode == "AUTO" and state.gate and iris_bucket() == "open" then
-            -- If an incoming activation is active, keep trying through the
-            -- normal locked choke point. A busy/unknown/transition state will
-            -- be refused safely rather than blind-toggled.
-            if state.incoming then
-                close_iris("incoming/recovery")
-            end
+        if CONFIG.auto_iris and state.mode == "AUTO" and state.gate and iris_bucket() == "open" and state.incoming then
+            close_iris("incoming/recovery")
         end
 
         sleep(CONFIG.refresh_interval)
@@ -956,9 +1207,11 @@ local function status_text()
     if not state.connected then
         return "OFFLINE"
     end
+
     if not state.gate_merged then
         return "NOT MERGED"
     end
+
     return tostring(state.gate_status or "UNKNOWN"):upper()
 end
 
@@ -966,6 +1219,7 @@ local function energy_text()
     if not state.connected or not state.max_energy or state.max_energy <= 0 then
         return "N/A"
     end
+
     return string.format(
         "%d / %d (%d%%)",
         state.energy,
@@ -1236,7 +1490,9 @@ local function draw_log()
         term.setCursorPos(2, row)
         term.write(tostring(state.events[i]):sub(1, 76))
         row = row + 1
-        if row > 24 then break end
+        if row > 24 then
+            break
+        end
     end
 
     term.setCursorPos(2, 26)
@@ -1306,8 +1562,9 @@ local function startup()
 end
 
 startup()
-parallel.waitForAny(security_loop, refresh_loop, ui_loop)
+parallel.waitForAny(security_loop, refresh_loop, audio_loop, ui_loop)
 state.running = false
+stop_alarm_audio()
 save_data()
 save_events()
 term.clear()
