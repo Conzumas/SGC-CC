@@ -19,15 +19,13 @@ local CONFIG = {
     iris_lock_timeout = 15,
     auto_iris = true,
 
-    -- Disk alarms. CC:Tweaked provides playAudio/stopAudio for records,
-    -- but no record-playback-complete event. These values therefore represent
-    -- the measured burst length of each alarm in seconds and are used only
+    -- Disk alarms. These values are the measured burst lengths and are used
     -- to decide when the next replay may begin.
     audio = {
         incoming_drive = "drive_3",
         outgoing_drive = "drive_2",
-        incoming_repeat_seconds = 3.0,
-        outgoing_repeat_seconds = 3.0,
+        incoming_repeat_seconds = 1.5,
+        outgoing_repeat_seconds = 1.5,
         poll_interval = 0.05,
     },
 }
@@ -655,9 +653,7 @@ local function glyph_picker(initial_symbols)
 
         elseif key == keys.left then
             local target = cursor - rows
-            if target < 1 then
-                target = cursor
-            else
+            if target >= 1 then
                 cursor = target
             end
 
@@ -876,37 +872,44 @@ local function audio_play_once(kind)
         return false
     end
 
-    state.audio_error_reported[drive] = nil
-
-    local ok_play, result = pcall(disk.playAudio, drive)
-    if not ok_play then
-        if not state.audio_error_reported[drive .. ":play"] then
-            state.audio_error_reported[drive .. ":play"] = true
-            log_event("AUDIO " .. kind:upper() .. " FAILED: " .. tostring(result))
+    local ok = pcall(disk.playAudio, drive)
+    if not ok then
+        local message = "AUDIO " .. kind:upper() .. " FAILED: unable to play " .. tostring(drive)
+        if not state.audio_error_reported[drive] then
+            state.audio_error_reported[drive] = true
+            log_event(message)
         end
         return false
     end
 
-    state.audio_error_reported[drive .. ":play"] = nil
+    state.audio_error_reported[drive] = nil
     state.audio_alarm_since = os.epoch("utc")
     return true
 end
 
 local function audio_loop()
     while state.running do
-        if state.audio_alarm then
-            local repeat_seconds = audio_repeat_seconds(state.audio_alarm)
-            local elapsed = state.audio_alarm_since and (os.epoch("utc") - state.audio_alarm_since) / 1000 or nil
-
-            if not state.audio_alarm_since then
-                audio_play_once(state.audio_alarm)
-            elseif repeat_seconds and elapsed >= repeat_seconds then
-                audio_play_once(state.audio_alarm)
+        local kind = state.audio_alarm
+        if kind then
+            local repeat_seconds = audio_repeat_seconds(kind)
+            if repeat_seconds then
+                if not state.audio_alarm_since then
+                    audio_play_once(kind)
+                elseif (os.epoch("utc") - state.audio_alarm_since) >= repeat_seconds * 1000 then
+                    -- Do not restart unless the requested alarm is still active.
+                    if state.audio_alarm == kind then
+                        audio_play_once(kind)
+                    end
+                end
             end
+        else
+            state.audio_alarm_since = nil
         end
 
         sleep(CONFIG.audio.poll_interval)
     end
+
+    stop_alarm_audio()
 end
 
 -----------------------------------------------------------------------
@@ -984,7 +987,7 @@ local function dial_saved(index)
     state.incoming = false
     state.incoming_address = nil
     state.alert = nil
-    set_alarm_audio("outgoing", "dial accepted")
+    set_alarm_audio("outgoing", "outgoing dial accepted")
 
     log_event("DIAL ACCEPTED: " .. tostring(entry.name) .. " [" .. address_to_string(symbols) .. "]")
 end
@@ -1027,7 +1030,7 @@ local function handle_jsg_event(event, ...)
         if source == "INCOMING_WORMHOLE" then
             state.incoming = true
             state.alert = "!!! INCOMING WORMHOLE !!!"
-            set_alarm_audio("incoming", "incoming chevron")
+            set_alarm_audio("incoming", "incoming chevron activity")
         end
 
         log_event("CHEVRON " .. tostring(chevron or "?") .. " ENGAGED: " .. tostring(symbol or "?") .. " [" .. tostring(source or "?") .. "]")
@@ -1046,7 +1049,9 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_attempt_open_failed" then
         state.dialing = false
-        stop_alarm_audio()
+        if state.audio_alarm == "outgoing" then
+            stop_alarm_audio()
+        end
         log_event("GATE OPEN FAILED: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_attempt_close_failed" then
@@ -1065,9 +1070,7 @@ local function handle_jsg_event(event, ...)
         else
             state.incoming = false
             state.alert = nil
-            if state.audio_alarm ~= "incoming" then
-                set_alarm_audio("outgoing", "outgoing wormhole open")
-            end
+            stop_alarm_audio()
         end
 
         log_event((initiating == false and "INCOMING" or "OUTGOING") .. " WORMHOLE OPEN: " .. address_to_string(address))
@@ -1123,13 +1126,14 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_iris_destroyed" then
         state.alert = "!!! IRIS DESTROYED !!!"
+        log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
         state.iris_state = nil
         release_iris_lock()
-        log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_iris_out_of_power" then
         state.alert = "!!! IRIS OUT OF POWER !!!"
         log_event("!!! IRIS OUT OF POWER !!!")
+
     end
 end
 
@@ -1184,15 +1188,17 @@ local function refresh_loop()
         if state.iris_toggle_pending and state.iris_pending_since then
             local elapsed = os.epoch("utc") - state.iris_pending_since
             if elapsed >= CONFIG.iris_lock_timeout * 1000 then
-                if state.alert ~= "IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED" then
+                if not state.alert or state.alert ~= "IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED" then
                     state.alert = "IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED"
                     log_event("!!! IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED !!!")
                 end
             end
         end
 
-        if CONFIG.auto_iris and state.mode == "AUTO" and state.gate and iris_bucket() == "open" and state.incoming then
-            close_iris("incoming/recovery")
+        if CONFIG.auto_iris and state.mode == "AUTO" and state.gate and iris_bucket() == "open" then
+            if state.incoming then
+                close_iris("incoming/recovery")
+            end
         end
 
         sleep(CONFIG.refresh_interval)
@@ -1207,11 +1213,9 @@ local function status_text()
     if not state.connected then
         return "OFFLINE"
     end
-
     if not state.gate_merged then
         return "NOT MERGED"
     end
-
     return tostring(state.gate_status or "UNKNOWN"):upper()
 end
 
@@ -1219,7 +1223,6 @@ local function energy_text()
     if not state.connected or not state.max_energy or state.max_energy <= 0 then
         return "N/A"
     end
-
     return string.format(
         "%d / %d (%d%%)",
         state.energy,
@@ -1490,9 +1493,7 @@ local function draw_log()
         term.setCursorPos(2, row)
         term.write(tostring(state.events[i]):sub(1, 76))
         row = row + 1
-        if row > 24 then
-            break
-        end
+        if row > 24 then break end
     end
 
     term.setCursorPos(2, 26)
@@ -1564,9 +1565,9 @@ end
 startup()
 parallel.waitForAny(security_loop, refresh_loop, audio_loop, ui_loop)
 state.running = false
-stop_alarm_audio()
 save_data()
 save_events()
+stop_alarm_audio()
 term.clear()
 term.setCursorPos(1, 1)
 print("SGC system offline.")
