@@ -4,21 +4,14 @@
 --
 -- Security-critical design rules:
 --   * pcall success is NOT JSG operation success.
---   * Iris toggling has exactly one choke point.
---   * The iris toggle lock is acquired before any yielding call.
---   * Unknown/transitional iris states are never blindly toggled.
+--   * Iris is monitored here; JSG owns iris/GDO mechanics.
 --   * Security/event handling runs independently of the UI.
-
-local release_iris_lock
-local header
 
 local CONFIG = {
     data_file = "sgc_data",
     event_log_file = "sgc_events",
     max_log_entries = 200,
     refresh_interval = 0.5,
-    iris_lock_timeout = 15,
-    auto_iris = true,
 
     -- Disk alarms. These values are the measured burst lengths and are used
     -- to decide when the next replay may begin.
@@ -50,10 +43,6 @@ local state = {
     iris_durability_display = nil,
     iris_durability = nil,
     iris_max_durability = nil,
-    iris_toggle_pending = false,
-    iris_pending_token = nil,
-    iris_pending_direction = nil,
-    iris_pending_since = nil,
 
     incoming = false,
     incoming_address = nil,
@@ -75,7 +64,6 @@ local state = {
     events = {},
     addresses = {},
     selected_address = 1,
-    mode = "AUTO",
     last_event = "System initialized",
 }
 
@@ -194,7 +182,6 @@ end
 local function save_data()
     save_table(CONFIG.data_file, {
         addresses = state.addresses,
-        mode = state.mode,
     })
 end
 
@@ -203,10 +190,6 @@ local function load_data()
 
     if type(data.addresses) == "table" then
         state.addresses = data.addresses
-    end
-
-    if data.mode == "AUTO" or data.mode == "MANUAL" then
-        state.mode = data.mode
     end
 
     state.selected_address = math.max(1, math.min(state.selected_address, math.max(1, #state.addresses)))
@@ -235,7 +218,28 @@ local function log_event(message)
 end
 
 -----------------------------------------------------------------------
--- Gate discovery / state
+-- UI helpers needed by the glyph picker
+-----------------------------------------------------------------------
+
+local function clear_line(y)
+    term.setCursorPos(1, y)
+    term.clearLine()
+end
+
+local function header(title)
+    clear_line(1)
+    term.setCursorPos(1, 1)
+    term.write("S T A R G A T E   C O M M A N D")
+    clear_line(2)
+    term.setCursorPos(1, 2)
+    term.write("================================")
+    clear_line(3)
+    term.setCursorPos(1, 3)
+    term.write("[ " .. tostring(title) .. " ]")
+end
+
+-----------------------------------------------------------------------
+-- Gate discovery / monitoring state
 -----------------------------------------------------------------------
 
 local function clear_gate_state()
@@ -283,9 +287,6 @@ local function ensure_gate()
 
     local gate, name = find_gate()
     if not gate then
-        if old_gate ~= nil then
-            release_iris_lock()
-        end
         state.gate = nil
         state.gate_name = nil
         clear_gate_state()
@@ -293,8 +294,7 @@ local function ensure_gate()
     end
 
     if old_gate ~= nil and gate ~= old_gate then
-        release_iris_lock()
-        log_event("Gate peripheral changed; invalidated pending iris toggle")
+        log_event("Gate peripheral changed")
     end
 
     local was_connected = state.connected
@@ -379,144 +379,6 @@ local function refresh_gate()
 end
 
 -----------------------------------------------------------------------
--- Iris state / single choke point
------------------------------------------------------------------------
-
-local function iris_bucket()
-    local value = tostring(state.iris_state or ""):lower()
-
-    if value == "opened" then
-        return "open"
-    elseif value == "closed" then
-        return "closed"
-    elseif value == "opening" or value == "closing" then
-        return "transition"
-    end
-
-    return "unknown"
-end
-
-release_iris_lock = function()
-    state.iris_toggle_pending = false
-    state.iris_pending_token = nil
-    state.iris_pending_direction = nil
-    state.iris_pending_since = nil
-end
-
-local function maybe_release_iris_lock()
-    if not state.iris_toggle_pending then
-        return
-    end
-
-    local bucket = iris_bucket()
-    if state.iris_pending_direction == "CLOSE" and bucket == "closed" then
-        release_iris_lock()
-    elseif state.iris_pending_direction == "OPEN" and bucket == "open" then
-        release_iris_lock()
-    end
-end
-
-local function toggle_iris(direction, reason)
-    direction = tostring(direction):upper()
-    if direction ~= "OPEN" and direction ~= "CLOSE" then
-        return false
-    end
-
-    if not state.gate or not state.gate.toggleIris then
-        log_event("IRIS " .. direction .. " FAILED: toggleIris() unavailable")
-        return false
-    end
-
-    if state.iris_toggle_pending then
-        log_event("IRIS " .. direction .. " REFUSED: toggle already in progress")
-        return false
-    end
-
-    local token = {}
-    state.iris_toggle_pending = true
-    state.iris_pending_token = token
-    state.iris_pending_direction = direction
-    state.iris_pending_since = os.epoch("utc")
-
-    refresh_gate()
-
-    if not state.connected or not state.iris_state then
-        if state.iris_pending_token == token then
-            release_iris_lock()
-            log_event("IRIS " .. direction .. " REFUSED: iris state unknown")
-        end
-        return false
-    end
-
-    local bucket = iris_bucket()
-
-    if bucket == "unknown" then
-        if state.iris_pending_token == token then
-            release_iris_lock()
-            log_event("IRIS " .. direction .. " REFUSED: iris state unknown/error")
-        end
-        return false
-    end
-
-    if bucket == "transition" then
-        if state.iris_pending_token == token then
-            release_iris_lock()
-            log_event("IRIS " .. direction .. " REFUSED: iris is already transitioning")
-        end
-        return false
-    end
-
-    if direction == "CLOSE" and bucket == "closed" then
-        if state.iris_pending_token == token then
-            release_iris_lock()
-        end
-        return true
-    end
-
-    if direction == "OPEN" and bucket == "open" then
-        if state.iris_pending_token == token then
-            release_iris_lock()
-        end
-        return true
-    end
-
-    if (direction == "CLOSE" and bucket ~= "open") or (direction == "OPEN" and bucket ~= "closed") then
-        if state.iris_pending_token == token then
-            release_iris_lock()
-            log_event("IRIS " .. direction .. " REFUSED: state changed before command")
-        end
-        return false
-    end
-
-    local ok, success, code, message = safe_call(state.gate.toggleIris)
-
-    if state.iris_pending_token ~= token then
-        log_event("IRIS " .. direction .. " STALE COMPLETION IGNORED")
-        return false
-    end
-
-    local worked, detail = jsg_result(ok, success, code, message)
-
-    if not worked then
-        release_iris_lock()
-        log_event("IRIS " .. direction .. " FAILED: " .. detail)
-        return false
-    end
-
-    state.iris_state = direction == "CLOSE" and "CLOSING" or "OPENING"
-    log_event("IRIS " .. direction .. " ACCEPTED: " .. tostring(reason or "operator"))
-    return true
-end
-
-local function close_iris(reason)
-    return toggle_iris("CLOSE", reason)
-end
-
-local function open_iris(reason)
-    return toggle_iris("OPEN", reason)
-end
-
------------------------------------------------------------------------
 -- Address handling
 -----------------------------------------------------------------------
 
@@ -575,9 +437,6 @@ local function validate_address(symbols)
     return true, normalized
 end
 
--- Interactive selector used by Address Book. It always starts from a fresh
--- getSymbolsMap() result and returns canonical symbol strings in selection
--- order. The caller runs validate_address() again before storing them.
 local function glyph_picker(initial_symbols)
     local symbols = get_symbol_map()
     if not symbols or #symbols == 0 then
@@ -901,7 +760,6 @@ local function audio_loop()
                 if not state.audio_alarm_since then
                     audio_play_once(kind)
                 elseif (os.epoch("utc") - state.audio_alarm_since) >= repeat_seconds * 1000 then
-                    -- Do not restart unless the requested alarm is still active.
                     if state.audio_alarm == kind then
                         audio_play_once(kind)
                     end
@@ -913,8 +771,6 @@ local function audio_loop()
 
         sleep(CONFIG.audio.poll_interval)
     end
-
-    stop_alarm_audio()
 end
 
 -----------------------------------------------------------------------
@@ -1011,10 +867,6 @@ local function handle_jsg_event(event, ...)
         state.alert = "!!! INCOMING WORMHOLE !!!"
         set_alarm_audio("incoming", "incoming wormhole")
         log_event("INCOMING WORMHOLE DETECTED: " .. tostring(address_size or "unknown") .. " symbols")
-
-        if CONFIG.auto_iris and state.mode == "AUTO" then
-            close_iris("incoming wormhole")
-        end
 
     elseif event == "stargate_spin_start" then
         state.ring_spinning = true
@@ -1114,7 +966,6 @@ local function handle_jsg_event(event, ...)
     elseif event == "stargate_iris_state_changed" then
         state.iris_state = args[2]
         log_event("IRIS STATE: " .. tostring(args[1]) .. " -> " .. tostring(args[2]))
-        maybe_release_iris_lock()
 
     elseif event == "stargate_iris_toggled" then
         log_event("IRIS TOGGLE EVENT: close=" .. tostring(args[1]))
@@ -1131,14 +982,12 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_iris_destroyed" then
         state.alert = "!!! IRIS DESTROYED !!!"
-        log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
         state.iris_state = nil
-        release_iris_lock()
+        log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_iris_out_of_power" then
         state.alert = "!!! IRIS OUT OF POWER !!!"
         log_event("!!! IRIS OUT OF POWER !!!")
-
     end
 end
 
@@ -1153,7 +1002,6 @@ local function security_loop()
         if event == "peripheral" or event == "peripheral_detach" then
             ensure_gate()
             refresh_gate()
-            maybe_release_iris_lock()
 
         elseif event == "stargate_wormhole_incoming"
             or event == "stargate_spin_start"
@@ -1188,24 +1036,6 @@ local function refresh_loop()
     while state.running do
         ensure_gate()
         refresh_gate()
-        maybe_release_iris_lock()
-
-        if state.iris_toggle_pending and state.iris_pending_since then
-            local elapsed = os.epoch("utc") - state.iris_pending_since
-            if elapsed >= CONFIG.iris_lock_timeout * 1000 then
-                if not state.alert or state.alert ~= "IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED" then
-                    state.alert = "IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED"
-                    log_event("!!! IRIS TOGGLE STUCK - MANUAL CHECK REQUIRED !!!")
-                end
-            end
-        end
-
-        if CONFIG.auto_iris and state.mode == "AUTO" and state.gate and iris_bucket() == "open" then
-            if state.incoming then
-                close_iris("incoming/recovery")
-            end
-        end
-
         sleep(CONFIG.refresh_interval)
     end
 end
@@ -1236,23 +1066,6 @@ local function energy_text()
     )
 end
 
-local function clear_line(y)
-    term.setCursorPos(1, y)
-    term.clearLine()
-end
-
-header = function(title)
-    clear_line(1)
-    term.setCursorPos(1, 1)
-    term.write("S T A R G A T E   C O M M A N D")
-    clear_line(2)
-    term.setCursorPos(1, 2)
-    term.write("================================")
-    clear_line(3)
-    term.setCursorPos(1, 3)
-    term.write("[ " .. tostring(title) .. " ]")
-end
-
 local function draw_main()
     term.clear()
     header("MAIN CONTROL")
@@ -1262,7 +1075,7 @@ local function draw_main()
     term.setCursorPos(2, 6)
     term.write("ENERGY: " .. energy_text())
     term.setCursorPos(2, 7)
-    term.write("IRIS:   " .. tostring(state.iris_state or "UNKNOWN"):upper() .. "  [" .. state.mode .. "]")
+    term.write("IRIS:   " .. tostring(state.iris_state or "UNKNOWN"):upper())
 
     term.setCursorPos(2, 9)
     term.write("LOCAL ADDRESS:")
@@ -1303,17 +1116,17 @@ local function draw_main()
     end
 
     term.setCursorPos(2, 20)
-    term.write("1 ADDRESS BOOK")
+    term.write("1  ADDRESS BOOK")
     term.setCursorPos(2, 21)
-    term.write("2 DIAL SELECTED")
+    term.write("2  DIAL SELECTED")
     term.setCursorPos(2, 22)
-    term.write("3 IRIS CONTROL")
+    term.write("3  IRIS MONITOR")
     term.setCursorPos(2, 23)
-    term.write("4 EVENT LOG")
+    term.write("4  EVENT LOG")
     term.setCursorPos(2, 24)
-    term.write("5 REFRESH")
+    term.write("5  REFRESH")
     term.setCursorPos(2, 25)
-    term.write("Q SHUTDOWN")
+    term.write("Q  SHUTDOWN")
 
     if state.alert then
         term.setCursorPos(38, 20)
@@ -1384,104 +1197,49 @@ local function address_menu()
     end
 end
 
-local function draw_iris()
+local function draw_iris_monitor()
     term.clear()
-    header("IRIS CONTROL")
+    header("IRIS MONITOR")
 
     term.setCursorPos(2, 5)
-    term.write("STATE: " .. tostring(state.iris_state or "UNKNOWN"):upper())
+    term.write("STATE:      " .. tostring(state.iris_state or "UNKNOWN"):upper())
     term.setCursorPos(2, 6)
-    term.write("TYPE:  " .. tostring(state.iris_type or "UNKNOWN"):upper())
+    term.write("TYPE:       " .. tostring(state.iris_type or "UNKNOWN"):upper())
     term.setCursorPos(2, 7)
-    term.write("MODE:  " .. state.mode)
-    term.setCursorPos(2, 8)
     term.write("DURABILITY: " .. tostring(state.iris_durability_display or "UNKNOWN"))
 
     if state.iris_durability and state.iris_max_durability then
-        term.setCursorPos(2, 9)
+        term.setCursorPos(2, 8)
         term.write("CURRENT/MAX: " .. tostring(state.iris_durability) .. " / " .. tostring(state.iris_max_durability))
     end
 
-    if state.iris_toggle_pending then
-        term.setCursorPos(2, 11)
-        term.write("TOGGLE: " .. tostring(state.iris_pending_direction) .. " IN PROGRESS")
-    elseif state.alert then
-        term.setCursorPos(2, 11)
+    term.setCursorPos(2, 10)
+    term.write("CONTROL: JSG / GDO")
+    term.setCursorPos(2, 11)
+    term.write("SGC does not command the iris.")
+    term.setCursorPos(2, 12)
+    term.write("JSG handles iris-code validation and mechanics.")
+
+    if state.alert then
+        term.setCursorPos(2, 14)
         term.write(tostring(state.alert):sub(1, 74))
     end
 
-    term.setCursorPos(2, 13)
-    term.write("O OPEN (MANUAL ONLY)")
-    term.setCursorPos(2, 14)
-    term.write("C CLOSE")
-    term.setCursorPos(2, 15)
-    term.write("A TOGGLE AUTO/MANUAL")
-    term.setCursorPos(2, 16)
-    term.write("F FORCE-CLEAR STUCK SOFTWARE LOCK")
-    term.setCursorPos(2, 17)
-    term.write("B BACK")
-
     term.setCursorPos(2, 20)
-    term.write("JSG handles native GDO/iris-code validation.")
+    term.write("R REFRESH")
     term.setCursorPos(2, 21)
-    term.write("Unknown or transitioning iris states will not be blind-toggled.")
+    term.write("B BACK")
 end
 
-local function force_clear_iris_lock()
-    if not state.iris_toggle_pending then
-        log_event("FORCE CLEAR REFUSED: no iris toggle lock is active")
-        return
-    end
-
-    term.clear()
-    print("!!! WARNING !!!")
-    print("This only clears the SGC SOFTWARE lock.")
-    print("It does NOT move the physical iris.")
-    print("")
-    print("Only continue after physically verifying the iris state.")
-    write("Type FORCE to continue: ")
-
-    if trim(read()) == "FORCE" then
-        release_iris_lock()
-        state.iris_state = nil
-        state.alert = "IRIS STATE MUST BE VERIFIED"
-        log_event("IRIS SOFTWARE LOCK FORCE-CLEARED - STATE VERIFICATION REQUIRED")
-    else
-        log_event("IRIS SOFTWARE LOCK FORCE-CLEAR CANCELLED")
-    end
-end
-
-local function iris_menu()
+local function iris_monitor_menu()
     while state.running do
         refresh_gate()
-        draw_iris()
+        draw_iris_monitor()
         local _, key = os.pullEvent("key")
 
-        if key == keys.o then
-            if state.mode == "MANUAL" then
-                open_iris("manual control")
-            else
-                log_event("MANUAL OPEN BLOCKED: switch iris mode to MANUAL first")
-            end
-
-        elseif key == keys.c then
-            close_iris("manual control")
-
-        elseif key == keys.a then
-            state.mode = state.mode == "AUTO" and "MANUAL" or "AUTO"
-            save_data()
-            log_event("IRIS MODE: " .. state.mode)
-            if state.mode == "AUTO" and state.incoming then
-                close_iris("AUTO enabled during incoming activation")
-            end
-
-        elseif key == keys.f then
-            if state.iris_toggle_pending then
-                force_clear_iris_lock()
-            else
-                log_event("FORCE CLEAR REFUSED: no iris toggle lock is active")
-            end
-
+        if key == keys.r then
+            refresh_gate()
+            log_event("IRIS MONITOR REFRESH")
         elseif key == keys.b then
             return
         end
@@ -1525,16 +1283,12 @@ local function ui_loop()
         elseif key == keys.two then
             dial_saved(state.selected_address)
         elseif key == keys.three then
-            iris_menu()
+            iris_monitor_menu()
         elseif key == keys.four then
             log_menu()
         elseif key == keys.five then
             ensure_gate()
             refresh_gate()
-            maybe_release_iris_lock()
-            if CONFIG.auto_iris and state.mode == "AUTO" and state.incoming and iris_bucket() == "open" then
-                close_iris("manual refresh fail-closed")
-            end
             log_event("MANUAL REFRESH")
         elseif key == keys.q then
             state.running = false
@@ -1556,12 +1310,7 @@ local function startup()
 
     if ensure_gate() then
         refresh_gate()
-        maybe_release_iris_lock()
         log_event("Gate status at startup: " .. status_text())
-
-        if CONFIG.auto_iris and state.mode == "AUTO" and iris_bucket() == "open" then
-            close_iris("startup fail-closed")
-        end
     else
         log_event("NO STARGATE PERIPHERAL FOUND")
     end
