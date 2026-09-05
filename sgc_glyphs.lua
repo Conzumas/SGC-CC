@@ -52,7 +52,7 @@ local function draw_symbols(symbols)
 
         for row = 0, rows - 1 do
             for column = 0, columns - 1 do
-                local index = (page - 1) * per_page + row + column * rows
+                local index = (page - 1) * per_page + row + column * rows + 1
                 local symbol = symbols[index]
                 local x = 2 + column * math.floor(width / columns)
                 local y = 6 + row
