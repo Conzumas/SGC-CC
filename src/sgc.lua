@@ -1283,6 +1283,7 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_wormhole_close_fully" then
         local address, reason, initiating = args[1], args[2], args[3]
+        local was_iris_authorized = state.iris_authorized
         state.iris_authorized = false
         state.iris_open_pending = false
         state.dialing = false
@@ -1294,8 +1295,13 @@ local function handle_jsg_event(event, ...)
         stop_alarm_audio()
 
         if state.iris_sgc_locked then
-            state.iris_reopen_pending = true
-            reopen_iris_after_disconnect("wormhole disconnected")
+            if was_iris_authorized then
+                state.iris_reopen_pending = true
+                reopen_iris_after_disconnect("authorized wormhole disconnected")
+            else
+                state.iris_reopen_pending = false
+                log_event("IRIS REMAINS CLOSED: wormhole disconnected without GDO authorization")
+            end
         end
 
         log_event("WORMHOLE CLOSED: " .. address_to_string(address) .. " / " .. tostring(reason or "unknown") .. " / initiating=" .. tostring(initiating))
