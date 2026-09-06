@@ -15,5 +15,3 @@ Early design / API verification phase. The goal is to build a reliable SGC compu
 ## Development rule
 
 Do not invent JSG APIs. If a method, event, or capability has not been verified against the target JSG version/source, mark it as unverified and investigate before implementing it.
-
-<!-- persistence-order-fixer trigger -->
