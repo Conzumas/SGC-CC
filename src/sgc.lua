@@ -63,6 +63,8 @@ local state = {
     iris_attack_active = false,
     iris_authorized = false,
     iris_open_pending = false,
+    iris_sgc_locked = false,
+    iris_reopen_pending = false,
 
     incoming = false,
     incoming_address = nil,
@@ -359,6 +361,8 @@ local function clear_gate_state()
     state.iris_max_durability = nil
     state.iris_authorized = false
     state.iris_open_pending = false
+    state.iris_sgc_locked = false
+    state.iris_reopen_pending = false
     iris_toggle_reservation = nil
 end
 
@@ -401,6 +405,8 @@ local function ensure_gate()
         log_event("Gate peripheral changed")
         iris_toggle_reservation = nil
         state.iris_open_pending = false
+        state.iris_sgc_locked = false
+        state.iris_reopen_pending = false
     end
 
     local was_connected = state.connected
@@ -517,9 +523,6 @@ end
 -- Iris security
 -----------------------------------------------------------------------
 
--- A toggle request is reserved until JSG confirms the requested state.
--- This prevents the incoming-lock path and GDO path from issuing opposing
--- toggles against the same stale iris state.
 local function toggle_iris_guarded(target_state, reason)
     local now_ms = os.epoch("utc")
 
@@ -531,7 +534,6 @@ local function toggle_iris_guarded(target_state, reason)
             log_event("IRIS TOGGLE RESERVATION EXPIRED: " .. tostring(iris_toggle_reservation.target_state))
             iris_toggle_reservation = nil
         else
-            log_event("IRIS TOGGLE BUSY: " .. tostring(reason or "security request"))
             return false, "iris_toggle_busy"
         end
     end
@@ -540,16 +542,12 @@ local function toggle_iris_guarded(target_state, reason)
         return false, "toggleIris() unavailable"
     end
 
-    iris_toggle_reservation = {
-        target_state = target_state,
-        created_at = now_ms,
-    }
-
+    iris_toggle_reservation = { target_state = target_state, created_at = now_ms }
     local ok, success, code, message = safe_call(state.gate.toggleIris)
     local worked, detail = jsg_result(ok, success, code, message)
     if not worked then
         iris_toggle_reservation = nil
-        log_event("IRIS TOGGLE FAILED: " .. detail)
+        log_event("IRIS TOGGLE FAILED: " .. tostring(detail))
         return false, detail
     end
 
@@ -564,13 +562,25 @@ local function close_iris_for_incoming(reason)
         return false
     end
 
-    if state.iris_state ~= "OPENED" and state.iris_state ~= "OPENING" then
+    if state.iris_state == "CLOSED" then
         return true
+    end
+
+    if state.iris_state == "CLOSING" then
+        state.iris_sgc_locked = true
+        return true
+    end
+
+    if state.iris_state ~= "OPENED" and state.iris_state ~= "OPENING" then
+        return false
     end
 
     local worked, detail = toggle_iris_guarded("CLOSED", reason or "incoming security lock")
     if not worked then
         if detail == "iris_toggle_busy" then
+            if iris_toggle_reservation and iris_toggle_reservation.target_state == "CLOSED" then
+                state.iris_sgc_locked = true
+            end
             return true
         end
         state.alert = "!!! IRIS LOCK FAILED !!!"
@@ -578,29 +588,72 @@ local function close_iris_for_incoming(reason)
         return false
     end
 
+    state.iris_sgc_locked = true
+    state.iris_reopen_pending = false
     log_event("IRIS CLOSED: " .. tostring(reason or "incoming security lock"))
+    return true
+end
+
+local function reopen_iris_after_disconnect(reason)
+    if not state.iris_sgc_locked then
+        state.iris_reopen_pending = false
+        return true
+    end
+
+    if not state.gate or not state.gate.toggleIris then
+        state.iris_reopen_pending = true
+        log_event("IRIS REOPEN DEFERRED: toggleIris() unavailable")
+        return false
+    end
+
+    if state.iris_state == "OPENED" then
+        state.iris_sgc_locked = false
+        state.iris_reopen_pending = false
+        log_event("IRIS RESTORED OPEN: already open")
+        return true
+    end
+
+    if state.iris_state == "CLOSING" or state.iris_state == "OPENING" then
+        state.iris_reopen_pending = true
+        return true
+    end
+
+    if state.iris_state ~= "CLOSED" then
+        state.iris_reopen_pending = true
+        log_event("IRIS REOPEN DEFERRED: state=" .. tostring(state.iris_state or "UNKNOWN"))
+        return false
+    end
+
+    local worked, detail = toggle_iris_guarded("OPENED", reason or "wormhole disconnected")
+    if not worked then
+        state.iris_reopen_pending = true
+        if detail ~= "iris_toggle_busy" then
+            state.alert = "!!! IRIS REOPEN FAILED !!!"
+            log_event("IRIS REOPEN FAILED: " .. tostring(detail))
+        end
+        return false
+    end
+
+    state.iris_reopen_pending = false
+    log_event("IRIS REOPEN REQUESTED: " .. tostring(reason or "wormhole disconnected"))
     return true
 end
 
 local function process_gdo_code(received_code)
     state.iris_authorized = false
-
     if not state.incoming then
         log_event("GDO AUTH REJECTED: no incoming connection")
         return false
     end
-
     if type(CONFIG.gdo_code) ~= "string" or CONFIG.gdo_code == "" then
         state.alert = "!!! GDO CODE NOT CONFIGURED !!!"
         log_event("GDO AUTH REJECTED: local GDO code is not configured")
         return false
     end
-
     if tostring(received_code) ~= CONFIG.gdo_code then
         log_event("GDO AUTH REJECTED: invalid code")
         return false
     end
-
     if not state.gate or not state.gate.toggleIris then
         state.alert = "!!! IRIS CONTROL UNAVAILABLE !!!"
         log_event("GDO AUTHENTICATED BUT IRIS CONTROL IS UNAVAILABLE")
@@ -608,7 +661,6 @@ local function process_gdo_code(received_code)
     end
 
     state.iris_authorized = true
-
     if state.iris_state == "CLOSED" then
         local worked, detail = toggle_iris_guarded("OPENED", "GDO authenticated")
         if not worked then
@@ -624,10 +676,7 @@ local function process_gdo_code(received_code)
         end
         state.iris_open_pending = false
     elseif state.iris_state == "OPENED" then
-        state.iris_open_pending = iris_toggle_reservation ~= nil and iris_toggle_reservation.target_state == "CLOSED"
-        if state.iris_open_pending then
-            log_event("GDO AUTHENTICATED: waiting for security close before reopening")
-        end
+        state.iris_open_pending = false
     else
         state.iris_open_pending = true
         log_event("GDO AUTHENTICATED: iris state " .. tostring(state.iris_state or "UNKNOWN") .. "; opening pending")
@@ -641,6 +690,8 @@ end
 local function enforce_incoming_iris_lock()
     if state.incoming and not state.iris_authorized then
         close_iris_for_incoming("incoming connection")
+    elseif not state.incoming and state.iris_reopen_pending then
+        reopen_iris_after_disconnect("pending disconnect restoration")
     end
 end
 
@@ -1240,8 +1291,13 @@ local function handle_jsg_event(event, ...)
         state.incoming = false
         state.incoming_address = nil
         state.alert = nil
-        iris_toggle_reservation = nil
         stop_alarm_audio()
+
+        if state.iris_sgc_locked then
+            state.iris_reopen_pending = true
+            reopen_iris_after_disconnect("wormhole disconnected")
+        end
+
         log_event("WORMHOLE CLOSED: " .. address_to_string(address) .. " / " .. tostring(reason or "unknown") .. " / initiating=" .. tostring(initiating))
 
     elseif event == "stargate_wormhole_subspace_connected" then
@@ -1278,15 +1334,24 @@ local function handle_jsg_event(event, ...)
 
         if state.iris_state == "OPENED" then
             state.iris_open_pending = false
-        elseif state.iris_state == "CLOSED" and state.incoming and state.iris_authorized and state.iris_open_pending then
-            state.iris_open_pending = false
-            local worked, detail = toggle_iris_guarded("OPENED", "pending GDO authorization")
-            if not worked then
-                state.iris_open_pending = true
-                state.alert = "!!! IRIS OPEN FAILED !!!"
-                log_event("PENDING GDO OPEN FAILED: " .. tostring(detail))
-            else
-                log_event("PENDING GDO OPEN: iris close confirmed; opening authorized")
+            if state.iris_reopen_pending then
+                state.iris_reopen_pending = false
+                state.iris_sgc_locked = false
+                log_event("IRIS RESTORED OPEN: disconnect recovery confirmed")
+            end
+        elseif state.iris_state == "CLOSED" then
+            if state.incoming and state.iris_authorized and state.iris_open_pending then
+                state.iris_open_pending = false
+                local worked, detail = toggle_iris_guarded("OPENED", "pending GDO authorization")
+                if not worked then
+                    state.iris_open_pending = true
+                    state.alert = "!!! IRIS OPEN FAILED !!!"
+                    log_event("PENDING GDO OPEN FAILED: " .. tostring(detail))
+                else
+                    log_event("PENDING GDO OPEN: iris close confirmed; opening authorized")
+                end
+            elseif not state.incoming and state.iris_reopen_pending then
+                reopen_iris_after_disconnect("disconnect restoration after iris close")
             end
         end
 
@@ -1323,10 +1388,16 @@ local function handle_jsg_event(event, ...)
         state.iris_last_hit_at = os.epoch("utc")
         iris_toggle_reservation = nil
         state.iris_open_pending = false
+        state.iris_sgc_locked = false
+        state.iris_reopen_pending = false
         log_event("!!! IRIS DESTROYED !!!: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_iris_out_of_power" then
         state.alert = "!!! IRIS OUT OF POWER !!!"
+        state.iris_sgc_locked = false
+        state.iris_reopen_pending = false
+        state.iris_open_pending = false
+        iris_toggle_reservation = nil
         log_event("!!! IRIS OUT OF POWER !!!")
     end
 end
