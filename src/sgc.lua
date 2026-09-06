@@ -205,15 +205,6 @@ local function save_data()
     })
 end
 
-local function report_data_save_failure(action, message)
-    state.alert = "!!! ADDRESS DATA SAVE FAILED !!!"
-    state.last_event = "ADDRESS DATA SAVE FAILED: " .. tostring(message or "unknown error")
-    if action then
-        state.last_event = "ADDRESS " .. tostring(action):upper() .. " SAVE FAILED: " .. tostring(message or "unknown error")
-    end
-    log_event(state.last_event)
-end
-
 local function load_data()
     local data, ok, error_message = load_table(CONFIG.data_file, {})
 
@@ -249,6 +240,16 @@ local function log_event(message)
     end
     state.last_event = message
     save_events()
+end
+
+
+local function report_data_save_failure(action, message)
+    state.alert = "!!! ADDRESS DATA SAVE FAILED !!!"
+    state.last_event = "ADDRESS DATA SAVE FAILED: " .. tostring(message or "unknown error")
+    if action then
+        state.last_event = "ADDRESS " .. tostring(action):upper() .. " SAVE FAILED: " .. tostring(message or "unknown error")
+    end
+    log_event(state.last_event)
 end
 
 -----------------------------------------------------------------------
