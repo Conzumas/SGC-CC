@@ -1,0 +1,75 @@
+name: Apply Claude Iris Review Patch
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-claude-iris-review.yml'
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/sgc.lua')
+          s = p.read_text()
+          old = '''    elseif event == "stargate_wormhole_close_fully" then
+        local address, reason, initiating = args[1], args[2], args[3]
+        state.iris_authorized = false
+        state.iris_open_pending = false
+        state.dialing = false
+        state.ring_spinning = false
+        state.dialed_address = nil
+        state.incoming = false
+        state.incoming_address = nil
+        state.alert = nil
+        stop_alarm_audio()
+
+        if state.iris_sgc_locked then
+            state.iris_reopen_pending = true
+            reopen_iris_after_disconnect("wormhole disconnected")
+        end
+
+        log_event("WORMHOLE CLOSED: " .. address_to_string(address) .. " / " .. tostring(reason or "unknown") .. " / initiating=" .. tostring(initiating))
+'''
+          new = '''    elseif event == "stargate_wormhole_close_fully" then
+        local address, reason, initiating = args[1], args[2], args[3]
+        local was_iris_authorized = state.iris_authorized
+        state.iris_authorized = false
+        state.iris_open_pending = false
+        state.dialing = false
+        state.ring_spinning = false
+        state.dialed_address = nil
+        state.incoming = false
+        state.incoming_address = nil
+        state.alert = nil
+        stop_alarm_audio()
+
+        if state.iris_sgc_locked then
+            if was_iris_authorized then
+                state.iris_reopen_pending = true
+                reopen_iris_after_disconnect("authorized wormhole disconnected")
+            else
+                state.iris_reopen_pending = false
+                log_event("IRIS REMAINS CLOSED: wormhole disconnected without GDO authorization")
+            end
+        end
+
+        log_event("WORMHOLE CLOSED: " .. address_to_string(address) .. " / " .. tostring(reason or "unknown") .. " / initiating=" .. tostring(initiating))
+'''
+          if old not in s:
+              raise SystemExit('expected wormhole close handler not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/sgc.lua
+          git commit -m 'fix: only auto-reopen iris after GDO authorization'
+          git push
