@@ -154,64 +154,84 @@ end
 
 local function load_table(path, fallback)
     if not fs.exists(path) then
-        return fallback
+        return fallback, true
     end
 
     local handle = fs.open(path, "r")
     if not handle then
-        return fallback
+        return fallback, false, "Unable to open " .. tostring(path)
     end
 
     local raw = handle.readAll()
     handle.close()
 
     if not raw or raw == "" then
-        return fallback
+        return fallback, false, "File is empty: " .. tostring(path)
     end
 
-    local fn = load(raw, path, "t", {})
-    if not fn then
-        return fallback
+    local result = textutils.unserialize(raw)
+    if type(result) == "table" then
+        return result, true
     end
 
-    local ok, result = pcall(fn)
-    if ok and type(result) == "table" then
-        return result
-    end
-
-    return fallback
+    return fallback, false, "Invalid serialized data in " .. tostring(path)
 end
 
 local function save_table(path, data)
+    local raw = textutils.serialize(data)
     local handle = fs.open(path, "w")
     if not handle then
-        return false
+        return false, "Unable to open " .. tostring(path) .. " for writing"
     end
 
-    handle.write(textutils.serialize(data))
+    handle.write(raw)
     handle.close()
+
+    if not fs.exists(path) then
+        return false, "File was not created: " .. tostring(path)
+    end
+
+    local size = fs.getSize(path)
+    if not size or size <= 0 then
+        return false, "File is empty after write: " .. tostring(path)
+    end
+
     return true
 end
 
 local function save_data()
-    save_table(CONFIG.data_file, {
+    return save_table(CONFIG.data_file, {
         addresses = state.addresses,
     })
 end
 
+local function report_data_save_failure(action, message)
+    state.alert = "!!! ADDRESS DATA SAVE FAILED !!!"
+    state.last_event = "ADDRESS DATA SAVE FAILED: " .. tostring(message or "unknown error")
+    if action then
+        state.last_event = "ADDRESS " .. tostring(action):upper() .. " SAVE FAILED: " .. tostring(message or "unknown error")
+    end
+    log_event(state.last_event)
+end
+
 local function load_data()
-    local data = load_table(CONFIG.data_file, {})
+    local data, ok, error_message = load_table(CONFIG.data_file, {})
 
     if type(data.addresses) == "table" then
         state.addresses = data.addresses
     end
 
     state.selected_address = math.max(1, math.min(state.selected_address, math.max(1, #state.addresses)))
+    return ok, error_message
 end
 
 local function load_events()
-    local events = load_table(CONFIG.event_log_file, {})
-    state.events = type(events) == "table" and events or {}
+    local events, ok = load_table(CONFIG.event_log_file, {})
+    if ok and type(events) == "table" then
+        state.events = events
+    else
+        state.events = {}
+    end
 end
 
 local function save_events()
@@ -273,6 +293,24 @@ local function remaining_time_text(epoch_ms)
 
     local delta = math.max(0, os.epoch("utc") - epoch_ms)
     return string.format("%0.1fs AGO", delta / 1000)
+end
+
+local function wrap_text(text, width)
+    text = tostring(text or "")
+    width = math.max(1, tonumber(width) or 1)
+
+    local lines = {}
+    while #text > width do
+        local cut = width
+        local space = text:sub(1, width):match("^.*() ")
+        if space and space > math.floor(width * 0.55) then
+            cut = space - 1
+        end
+        table.insert(lines, text:sub(1, cut))
+        text = text:sub(cut + 1):gsub("^%s+", "")
+    end
+    table.insert(lines, text)
+    return lines
 end
 
 local ui_timer = nil
@@ -672,7 +710,14 @@ local function add_address()
         symbols = normalized_or_error,
     })
     state.selected_address = #state.addresses
-    save_data()
+
+    local saved, save_error = save_data()
+    if not saved then
+        report_data_save_failure("ADD", save_error)
+        return
+    end
+
+    state.alert = nil
     log_event("ADDRESS ADDED: " .. name)
 end
 
@@ -713,7 +758,13 @@ local function edit_address(index)
         entry.symbols = normalized_or_error
     end
 
-    save_data()
+    local saved, save_error = save_data()
+    if not saved then
+        report_data_save_failure("EDIT", save_error)
+        return
+    end
+
+    state.alert = nil
     log_event("ADDRESS EDITED: " .. tostring(entry.name))
 end
 
@@ -733,7 +784,14 @@ local function remove_address(index)
     if trim(read()) == "YES" then
         table.remove(state.addresses, index)
         state.selected_address = math.min(state.selected_address, math.max(1, #state.addresses))
-        save_data()
+
+        local saved, save_error = save_data()
+        if not saved then
+            report_data_save_failure("REMOVE", save_error)
+            return
+        end
+
+        state.alert = nil
         log_event("ADDRESS REMOVED: " .. tostring(entry.name))
     else
         log_event("ADDRESS REMOVE CANCELLED")
@@ -894,27 +952,32 @@ local function dial_saved(index)
         return
     end
 
+    -- JSG's own dialAddress() is the authority for address validity. The
+    -- energy preflight is still useful, but a JSG address_malformed response
+    -- here is not treated as a final rejection because JSG performs its full
+    -- address/origin handling again when dialAddress() is invoked.
     local energy_ok, energy_success, energy_code, energy_map = safe_call(
         state.gate.getEnergyRequiredToDial,
         symbols
     )
 
     if not energy_ok then
-        log_event("DIAL PREFLIGHT FAILED: " .. tostring(energy_map))
+        log_event("DIAL PREFLIGHT ERROR: " .. tostring(energy_map))
         return
     end
 
     if energy_success ~= true then
-        log_event("DIAL PREFLIGHT FAILED: " .. tostring(energy_code or "unknown") .. ": " .. tostring(energy_map or "JSG rejected address"))
+        local reason = tostring(energy_code or "unknown") .. ": " .. tostring(energy_map or "JSG rejected the address")
+        if tostring(energy_code) == "address_malformed" then
+            log_event("DIAL PREFLIGHT WARNING: " .. reason .. "; proceeding to JSG dial")
+        else
+            log_event("DIAL PREFLIGHT FAILED: " .. reason)
+            return
+        end
+    elseif type(energy_map) ~= "table" then
+        log_event("DIAL PREFLIGHT ERROR: malformed energy response")
         return
-    end
-
-    if type(energy_map) ~= "table" then
-        log_event("DIAL PREFLIGHT FAILED: malformed energy response")
-        return
-    end
-
-    if energy_map.canOpen ~= true then
+    elseif energy_map.canOpen ~= true then
         log_event("DIAL PREFLIGHT FAILED: insufficient energy")
         return
     end
@@ -923,6 +986,7 @@ local function dial_saved(index)
     local worked, detail = jsg_result(ok, success, code, message)
     if not worked then
         log_event("DIAL FAILED: " .. detail)
+        state.alert = "!!! DIAL FAILED !!!"
         return
     end
 
@@ -994,6 +1058,7 @@ local function handle_jsg_event(event, ...)
         if state.audio_alarm == "outgoing" then
             stop_alarm_audio()
         end
+        state.alert = "!!! GATE OPEN FAILED !!!"
         log_event("GATE OPEN FAILED: " .. tostring(args[1] or "unknown"))
 
     elseif event == "stargate_attempt_close_failed" then
@@ -1384,7 +1449,6 @@ local function draw_iris_monitor()
     local iris_state = tostring(state.iris_state or "UNKNOWN"):upper()
     local iris_type = tostring(state.iris_type or "UNKNOWN"):upper()
     local attack = state.iris_attack_active and "DETECTED" or "NONE"
-    local thermal = "NOT EXPOSED BY JSG CC API"
     local durability = tostring(state.iris_durability_display or "UNKNOWN")
     local current_max = "UNKNOWN"
     local percent = "UNKNOWN"
@@ -1456,17 +1520,28 @@ local function draw_log()
     term.clear()
     header("EVENT LOG")
 
-    local _, height = term.getSize()
+    local width, height = term.getSize()
     local footer_rows = 1
     local first_row = 5
     local last_row = math.max(first_row, height - footer_rows - 1)
     local visible = math.max(1, last_row - first_row + 1)
-    local start = math.max(1, #state.events - visible + 1)
-    local row = first_row
+    local wrapped_entries = {}
 
-    for i = start, #state.events do
+    for i = #state.events, 1, -1 do
+        local lines = wrap_text(state.events[i], math.max(1, width - 3))
+        for j = #lines, 1, -1 do
+            table.insert(wrapped_entries, 1, lines[j])
+        end
+        if #wrapped_entries >= visible then
+            break
+        end
+    end
+
+    local start = math.max(1, #wrapped_entries - visible + 1)
+    local row = first_row
+    for i = start, #wrapped_entries do
         term.setCursorPos(2, row)
-        term.write(tostring(state.events[i]):sub(1, math.max(1, term.getSize() - 2)))
+        term.write(tostring(wrapped_entries[i]):sub(1, math.max(1, width - 2)))
         row = row + 1
         if row > last_row then
             break
@@ -1534,9 +1609,14 @@ local function startup()
     term.setCursorBlink(false)
     term.clear()
 
-    load_data()
+    local data_ok, data_error = load_data()
     load_events()
     log_event("SGC SYSTEM STARTING")
+
+    if not data_ok then
+        state.alert = "!!! ADDRESS DATA LOAD FAILED !!!"
+        log_event("ADDRESS DATA LOAD FAILED: " .. tostring(data_error or "unknown error") .. ". Starting with in-memory address book.")
+    end
 
     if ensure_gate() then
         refresh_gate()
