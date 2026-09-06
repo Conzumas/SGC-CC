@@ -9,13 +9,17 @@ permissions:
 
 jobs:
   patch:
-    if: github.event.head_commit.message != 'chore: apply iris restoration fix'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Patch iris ownership and disconnect recovery
-        shell: python
+        shell: bash
         run: |
+          set -euo pipefail
+          if [ "${{ github.event.head_commit.message }}" = "chore: apply iris restoration fix" ]; then
+            exit 0
+          fi
+          python3 <<'PY'
           from pathlib import Path
           import re
 
@@ -39,7 +43,7 @@ jobs:
 
           start = s.index('-----------------------------------------------------------------------\n-- Iris security\n-----------------------------------------------------------------------')
           end = s.index('-----------------------------------------------------------------------\n-- Address handling\n-----------------------------------------------------------------------', start)
-          iris = r'''-----------------------------------------------------------------------
+          iris = '''-----------------------------------------------------------------------
 -- Iris security
 -----------------------------------------------------------------------
 
@@ -343,8 +347,12 @@ end
                   s = s[:insert_at] + insertion + s[insert_at:]
 
           p.write_text(s)
+          print('patched', len(s), 'bytes')
+          PY
       - name: Commit patch and remove one-shot workflow
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           rm -f .github/workflows/iris-fix.yml
