@@ -509,6 +509,36 @@ end
 -- Iris security
 -----------------------------------------------------------------------
 
+-- All local iris toggles pass through this single serialized choke point.
+-- ComputerCraft is cooperative, but the security loops can both request a
+-- toggle from different event paths. The guard prevents a second request
+-- from observing the same state and issuing an opposing toggle.
+local iris_toggle_busy = false
+
+local function toggle_iris_guarded(reason)
+    if iris_toggle_busy then
+        log_event("IRIS TOGGLE BUSY: " .. tostring(reason or "security request"))
+        return false, "iris_toggle_busy"
+    end
+
+    if not state.gate or not state.gate.toggleIris then
+        return false, "toggleIris() unavailable"
+    end
+
+    iris_toggle_busy = true
+    local ok, success, code, message = safe_call(state.gate.toggleIris)
+    iris_toggle_busy = false
+
+    local worked, detail = jsg_result(ok, success, code, message)
+    if not worked then
+        log_event("IRIS TOGGLE FAILED: " .. detail)
+        return false, detail
+    end
+
+    log_event("IRIS TOGGLE ACCEPTED: " .. tostring(reason or "security request"))
+    return true
+end
+
 local function close_iris_for_incoming(reason)
     if not state.gate or not state.gate.toggleIris then
         state.alert = "!!! IRIS CONTROL UNAVAILABLE !!!"
@@ -520,11 +550,9 @@ local function close_iris_for_incoming(reason)
         return true
     end
 
-    local ok, success, code, message = safe_call(state.gate.toggleIris)
-    local worked, detail = jsg_result(ok, success, code, message)
+    local worked = toggle_iris_guarded(reason or "incoming security lock")
     if not worked then
         state.alert = "!!! IRIS LOCK FAILED !!!"
-        log_event("IRIS LOCK FAILED: " .. detail)
         return false
     end
 
@@ -558,11 +586,10 @@ local function process_gdo_code(received_code)
     end
 
     if state.iris_state == "CLOSED" then
-        local ok, success, code, message = safe_call(state.gate.toggleIris)
-        local worked, detail = jsg_result(ok, success, code, message)
+        local worked, detail = toggle_iris_guarded("GDO authenticated")
         if not worked then
             state.alert = "!!! IRIS OPEN FAILED !!!"
-            log_event("GDO AUTHENTICATED; IRIS OPEN FAILED: " .. detail)
+            log_event("GDO AUTHENTICATED; IRIS OPEN FAILED: " .. tostring(detail))
             return false
         end
     elseif state.iris_state ~= "OPENED" then
