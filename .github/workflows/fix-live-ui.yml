@@ -1,0 +1,193 @@
+name: Fix live UI timer and main layout
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor == 'Conzumas' && !contains(github.event.head_commit.message, 'Fix live UI timer and main layout')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch source
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          path = Path('src/sgc.lua')
+          source = path.read_text(encoding='utf-8')
+
+          # Main screen: place dynamic blocks using a running row counter so
+          # LAST and ALERT never overwrite incoming/dialing status lines.
+          old_main = '''    if state.incoming then
+        term.setCursorPos(2, 15)
+        term.write("!!! INCOMING WORMHOLE !!!")
+        term.setCursorPos(4, 16)
+        term.write(tostring(state.incoming_address or "UNKNOWN"):sub(1, 74))
+    end
+
+    if state.dialing then
+        term.setCursorPos(2, 17)
+        term.write(string.format("DIALING: %d / %d", state.dial_chevrons, state.dial_target_count))
+        if state.dial_last_symbol then
+            term.setCursorPos(4, 18)
+            term.write("LAST CHEVRON: " .. tostring(state.dial_last_symbol):sub(1, 60))
+        end
+    elseif state.ring_spinning then
+        term.setCursorPos(2, 17)
+        term.write("RING SPINNING: " .. tostring(state.ring_direction or "?") .. " @ " .. tostring(state.ring_speed or "?"))
+    end
+
+    if state.alert then
+        term.setCursorPos(2, 19)
+        term.write("ALERT: " .. tostring(state.alert):sub(1, 65))
+    end
+
+    local _, height = term.getSize()
+    local last_y = math.max(5, math.min(17, height - 3))
+    term.setCursorPos(2, last_y)
+    term.write("LAST: " .. tostring(state.last_event):sub(1, 74))
+'''
+          new_main = '''    local _, height = term.getSize()
+    local content_last = math.max(5, height - 2)
+    local row = 15
+
+    if state.incoming and row <= content_last then
+        term.setCursorPos(2, row)
+        term.write("!!! INCOMING WORMHOLE !!!")
+        row = row + 1
+        if row <= content_last then
+            term.setCursorPos(4, row)
+            term.write(tostring(state.incoming_address or "UNKNOWN"):sub(1, 74))
+            row = row + 1
+        end
+    end
+
+    if state.dialing and row <= content_last then
+        term.setCursorPos(2, row)
+        term.write(string.format("DIALING: %d / %d", state.dial_chevrons, state.dial_target_count))
+        row = row + 1
+        if state.dial_last_symbol and row <= content_last then
+            term.setCursorPos(4, row)
+            term.write("LAST CHEVRON: " .. tostring(state.dial_last_symbol):sub(1, 60))
+            row = row + 1
+        end
+    elseif state.ring_spinning and row <= content_last then
+        term.setCursorPos(2, row)
+        term.write("RING SPINNING: " .. tostring(state.ring_direction or "?") .. " @ " .. tostring(state.ring_speed or "?"))
+        row = row + 1
+    end
+
+    if state.last_event and row <= content_last then
+        term.setCursorPos(2, row)
+        term.write("LAST: " .. tostring(state.last_event):sub(1, 74))
+        row = row + 1
+    end
+
+    if state.alert and row <= content_last then
+        term.setCursorPos(2, row)
+        term.write("ALERT: " .. tostring(state.alert):sub(1, 65))
+    end
+'''
+          if old_main not in source:
+              raise SystemExit('main dynamic layout block not found')
+          source = source.replace(old_main, new_main, 1)
+
+          # Unconditionally renew the shared timer whenever a timer-aware menu
+          # regains control after a potentially blocking nested operation.
+          replacements = [
+              ('''            if key == keys.one then
+                address_menu()
+            elseif key == keys.two then
+                dial_saved(state.selected_address)
+            elseif key == keys.three then
+                iris_monitor_menu()
+            elseif key == keys.four then
+                log_menu()
+            elseif key == keys.five then
+                ensure_gate()
+                refresh_gate()
+                log_event("MANUAL REFRESH")
+            elseif key == keys.q then
+                state.running = false
+            end
+''', '''            if key == keys.one then
+                address_menu()
+                renew_ui_timer()
+            elseif key == keys.two then
+                dial_saved(state.selected_address)
+                renew_ui_timer()
+            elseif key == keys.three then
+                iris_monitor_menu()
+                renew_ui_timer()
+            elseif key == keys.four then
+                log_menu()
+                renew_ui_timer()
+            elseif key == keys.five then
+                ensure_gate()
+                refresh_gate()
+                log_event("MANUAL REFRESH")
+                renew_ui_timer()
+            elseif key == keys.q then
+                state.running = false
+            end
+'''),
+              ('''            elseif key == keys.d then
+                dial_saved(state.selected_address)
+            elseif key == keys.a then
+                add_address()
+            elseif key == keys.e then
+                edit_address(state.selected_address)
+            elseif key == keys.r then
+                remove_address(state.selected_address)
+            elseif key == keys.v then
+                address_details_menu()
+            elseif key == keys.b then
+                return
+            end
+''', '''            elseif key == keys.d then
+                dial_saved(state.selected_address)
+                renew_ui_timer()
+            elseif key == keys.a then
+                add_address()
+                renew_ui_timer()
+            elseif key == keys.e then
+                edit_address(state.selected_address)
+                renew_ui_timer()
+            elseif key == keys.r then
+                remove_address(state.selected_address)
+                renew_ui_timer()
+            elseif key == keys.v then
+                address_details_menu()
+                renew_ui_timer()
+            elseif key == keys.b then
+                return
+            end
+''')
+          ]
+
+          for old, new in replacements:
+              if old not in source:
+                  raise SystemExit('expected menu handler block not found')
+              source = source.replace(old, new, 1)
+
+          path.write_text(source, encoding='utf-8')
+
+      - name: Commit source and remove workflow
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/sgc.lua
+          git rm .github/workflows/fix-live-ui.yml
+          git commit -m 'Fix live UI timer and main layout'
+          git push origin HEAD:main
