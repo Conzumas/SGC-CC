@@ -1,6 +1,6 @@
 -- SGC-CC
 -- Stargate Command ComputerCraft control system for JSG
--- Target: Minecraft 1.20.1 Forge + CC:Tweaked
+-- Target: Minecraft 1.20.1 Forge + Just Stargate Mod + CC:Tweaked
 --
 -- Security-critical design rules:
 --   * pcall success is NOT JSG operation success.
@@ -399,6 +399,8 @@ local function ensure_gate()
 
     if old_gate ~= nil and gate ~= old_gate then
         log_event("Gate peripheral changed")
+        iris_toggle_reservation = nil
+        state.iris_open_pending = false
     end
 
     local was_connected = state.connected
@@ -566,9 +568,13 @@ local function close_iris_for_incoming(reason)
         return true
     end
 
-    local worked = toggle_iris_guarded("CLOSED", reason or "incoming security lock")
+    local worked, detail = toggle_iris_guarded("CLOSED", reason or "incoming security lock")
     if not worked then
+        if detail == "iris_toggle_busy" then
+            return true
+        end
         state.alert = "!!! IRIS LOCK FAILED !!!"
+        log_event("IRIS LOCK FAILED: " .. tostring(detail))
         return false
     end
 
