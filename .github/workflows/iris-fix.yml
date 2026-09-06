@@ -23,6 +23,6 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           rm -f patch_iris.py .github/workflows/iris-fix.yml iris-fix-trigger.txt iris-fix-trigger-2.txt iris-fix-trigger-3.txt
-          git add src/sgc.lua patch_iris.py .github/workflows/iris-fix.yml iris-fix-trigger.txt iris-fix-trigger-2.txt iris-fix-trigger-3.txt
+          git add -A
           git commit -m 'chore: apply iris restoration fix'
           git push
