@@ -18,8 +18,8 @@ local CONFIG = {
     audio = {
         incoming_drive = "drive_3",
         outgoing_drive = "drive_2",
-        incoming_repeat_seconds = 1.5,
-        outgoing_repeat_seconds = 1.5,
+        incoming_repeat_seconds = 3.0,
+        outgoing_repeat_seconds = 3.0,
         poll_interval = 0.05,
     },
 
@@ -241,7 +241,6 @@ local function log_event(message)
     state.last_event = message
     save_events()
 end
-
 
 local function report_data_save_failure(action, message)
     state.alert = "!!! ADDRESS DATA SAVE FAILED !!!"
