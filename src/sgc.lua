@@ -1200,34 +1200,46 @@ local function draw_main()
     term.setCursorPos(4, 13)
     term.write(address_to_string(state.dialed_address):sub(1, 74))
 
-    if state.incoming then
-        term.setCursorPos(2, 15)
+    local _, height = term.getSize()
+    local content_last = math.max(5, height - 2)
+    local row = 15
+
+    if state.incoming and row <= content_last then
+        term.setCursorPos(2, row)
         term.write("!!! INCOMING WORMHOLE !!!")
-        term.setCursorPos(4, 16)
-        term.write(tostring(state.incoming_address or "UNKNOWN"):sub(1, 74))
-    end
-
-    if state.dialing then
-        term.setCursorPos(2, 17)
-        term.write(string.format("DIALING: %d / %d", state.dial_chevrons, state.dial_target_count))
-        if state.dial_last_symbol then
-            term.setCursorPos(4, 18)
-            term.write("LAST CHEVRON: " .. tostring(state.dial_last_symbol):sub(1, 60))
+        row = row + 1
+        if row <= content_last then
+            term.setCursorPos(4, row)
+            term.write(tostring(state.incoming_address or "UNKNOWN"):sub(1, 74))
+            row = row + 1
         end
-    elseif state.ring_spinning then
-        term.setCursorPos(2, 17)
-        term.write("RING SPINNING: " .. tostring(state.ring_direction or "?") .. " @ " .. tostring(state.ring_speed or "?"))
     end
 
-    if state.alert then
-        term.setCursorPos(2, 19)
+    if state.dialing and row <= content_last then
+        term.setCursorPos(2, row)
+        term.write(string.format("DIALING: %d / %d", state.dial_chevrons, state.dial_target_count))
+        row = row + 1
+        if state.dial_last_symbol and row <= content_last then
+            term.setCursorPos(4, row)
+            term.write("LAST CHEVRON: " .. tostring(state.dial_last_symbol):sub(1, 60))
+            row = row + 1
+        end
+    elseif state.ring_spinning and row <= content_last then
+        term.setCursorPos(2, row)
+        term.write("RING SPINNING: " .. tostring(state.ring_direction or "?") .. " @ " .. tostring(state.ring_speed or "?"))
+        row = row + 1
+    end
+
+    if state.last_event and row <= content_last then
+        term.setCursorPos(2, row)
+        term.write("LAST: " .. tostring(state.last_event):sub(1, 74))
+        row = row + 1
+    end
+
+    if state.alert and row <= content_last then
+        term.setCursorPos(2, row)
         term.write("ALERT: " .. tostring(state.alert):sub(1, 65))
     end
-
-    local _, height = term.getSize()
-    local last_y = math.max(5, math.min(17, height - 3))
-    term.setCursorPos(2, last_y)
-    term.write("LAST: " .. tostring(state.last_event):sub(1, 74))
 
     draw_controls({
         "1 ADDRESS BOOK   2 DIAL SELECTED   3 IRIS MONITOR",
@@ -1307,10 +1319,13 @@ local function address_details_menu()
         local _, key = os.pullEvent("key")
         if key == keys.d then
             dial_saved(state.selected_address)
+            renew_ui_timer()
         elseif key == keys.e then
             edit_address(state.selected_address)
+            renew_ui_timer()
         elseif key == keys.r then
             remove_address(state.selected_address)
+            renew_ui_timer()
         elseif key == keys.b then
             return
         elseif key == keys.up then
@@ -1340,14 +1355,19 @@ local function address_menu()
                 end
             elseif key == keys.d then
                 dial_saved(state.selected_address)
+                renew_ui_timer()
             elseif key == keys.a then
                 add_address()
+                renew_ui_timer()
             elseif key == keys.e then
                 edit_address(state.selected_address)
+                renew_ui_timer()
             elseif key == keys.r then
                 remove_address(state.selected_address)
+                renew_ui_timer()
             elseif key == keys.v then
                 address_details_menu()
+                renew_ui_timer()
             elseif key == keys.b then
                 return
             end
@@ -1482,16 +1502,21 @@ local function ui_loop()
         if event == "key" then
             if p1 == keys.one then
                 address_menu()
+                renew_ui_timer()
             elseif p1 == keys.two then
                 dial_saved(state.selected_address)
+                renew_ui_timer()
             elseif p1 == keys.three then
                 iris_monitor_menu()
+                renew_ui_timer()
             elseif p1 == keys.four then
                 log_menu()
+                renew_ui_timer()
             elseif p1 == keys.five then
                 ensure_gate()
                 refresh_gate()
                 log_event("MANUAL REFRESH")
+                renew_ui_timer()
             elseif p1 == keys.q then
                 state.running = false
             end
