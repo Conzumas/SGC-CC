@@ -26,6 +26,10 @@ local CONFIG = {
     -- Iris telemetry stays live for a short period after a hit so the
     -- monitor remains visibly in an active/alarm state after an impact.
     iris_attack_hold_ms = 5000,
+
+    -- Must exactly match the GDO/iris code configured in the JSG Stargate GUI.
+    -- Leave empty to fail closed: incoming connections will stay locked.
+    gdo_code = "",
 }
 
 local state = {
@@ -57,6 +61,7 @@ local state = {
     iris_last_damage = nil,
     iris_last_hit_at = nil,
     iris_attack_active = false,
+    iris_authorized = false,
 
     incoming = false,
     incoming_address = nil,
@@ -348,6 +353,7 @@ local function clear_gate_state()
     state.iris_durability_display = nil
     state.iris_durability = nil
     state.iris_max_durability = nil
+    state.iris_authorized = false
 end
 
 local function find_gate()
@@ -497,6 +503,84 @@ local function refresh_gate()
     end
 
     return true
+end
+
+-----------------------------------------------------------------------
+-- Iris security
+-----------------------------------------------------------------------
+
+local function close_iris_for_incoming(reason)
+    if not state.gate or not state.gate.toggleIris then
+        state.alert = "!!! IRIS CONTROL UNAVAILABLE !!!"
+        log_event("IRIS LOCK FAILED: toggleIris() unavailable")
+        return false
+    end
+
+    if state.iris_state ~= "OPENED" and state.iris_state ~= "OPENING" then
+        return true
+    end
+
+    local ok, success, code, message = safe_call(state.gate.toggleIris)
+    local worked, detail = jsg_result(ok, success, code, message)
+    if not worked then
+        state.alert = "!!! IRIS LOCK FAILED !!!"
+        log_event("IRIS LOCK FAILED: " .. detail)
+        return false
+    end
+
+    log_event("IRIS CLOSED: " .. tostring(reason or "incoming security lock"))
+    return true
+end
+
+local function process_gdo_code(received_code)
+    state.iris_authorized = false
+
+    if not state.incoming then
+        log_event("GDO AUTH REJECTED: no incoming connection")
+        return false
+    end
+
+    if type(CONFIG.gdo_code) ~= "string" or CONFIG.gdo_code == "" then
+        state.alert = "!!! GDO CODE NOT CONFIGURED !!!"
+        log_event("GDO AUTH REJECTED: local GDO code is not configured")
+        return false
+    end
+
+    if tostring(received_code) ~= CONFIG.gdo_code then
+        log_event("GDO AUTH REJECTED: invalid code")
+        return false
+    end
+
+    if not state.gate or not state.gate.toggleIris then
+        state.alert = "!!! IRIS CONTROL UNAVAILABLE !!!"
+        log_event("GDO AUTHENTICATED BUT IRIS CONTROL IS UNAVAILABLE")
+        return false
+    end
+
+    if state.iris_state == "CLOSED" then
+        local ok, success, code, message = safe_call(state.gate.toggleIris)
+        local worked, detail = jsg_result(ok, success, code, message)
+        if not worked then
+            state.alert = "!!! IRIS OPEN FAILED !!!"
+            log_event("GDO AUTHENTICATED; IRIS OPEN FAILED: " .. detail)
+            return false
+        end
+    elseif state.iris_state ~= "OPENED" then
+        log_event("GDO AUTHENTICATED: iris state " .. tostring(state.iris_state or "UNKNOWN") .. "; waiting")
+        state.iris_authorized = true
+        return true
+    end
+
+    state.iris_authorized = true
+    state.alert = nil
+    log_event("GDO AUTHENTICATED: IRIS OPEN AUTHORIZED")
+    return true
+end
+
+local function enforce_incoming_iris_lock()
+    if state.incoming and not state.iris_authorized then
+        close_iris_for_incoming("incoming connection")
+    end
 end
 
 -----------------------------------------------------------------------
@@ -1012,8 +1096,10 @@ local function handle_jsg_event(event, ...)
     if event == "stargate_wormhole_incoming" then
         local address_size = args[1]
         state.incoming = true
+        state.iris_authorized = false
         state.incoming_address = "INCOMING DIAL (" .. tostring(address_size or "?") .. " SYMBOLS)"
         state.alert = "!!! INCOMING WORMHOLE !!!"
+        close_iris_for_incoming("incoming connection")
         set_alarm_audio("incoming", "incoming wormhole")
         log_event("INCOMING WORMHOLE DETECTED: " .. tostring(address_size or "unknown") .. " symbols")
 
@@ -1084,6 +1170,7 @@ local function handle_jsg_event(event, ...)
 
     elseif event == "stargate_wormhole_close_fully" then
         local address, reason, initiating = args[1], args[2], args[3]
+        state.iris_authorized = false
         state.dialing = false
         state.ring_spinning = false
         state.dialed_address = nil
@@ -1111,7 +1198,7 @@ local function handle_jsg_event(event, ...)
         end
 
     elseif event == "stargate_iris_code_received" then
-        log_event("GDO/IRIS CODE RECEIVED: JSG received a code")
+        process_gdo_code(args[1])
 
     elseif event == "stargate_iris_state_changed" then
         state.iris_state = args[2]
@@ -1201,6 +1288,7 @@ local function refresh_loop()
     while state.running do
         ensure_gate()
         refresh_gate()
+        enforce_incoming_iris_lock()
         sleep(CONFIG.refresh_interval)
     end
 end
@@ -1444,7 +1532,7 @@ end
 
 local function draw_iris_monitor()
     term.clear()
-    header("IRIS CONTROL / TELEMETRY")
+    header("IRIS CONTROL / SECURITY")
 
     local iris_state = tostring(state.iris_state or "UNKNOWN"):upper()
     local iris_type = tostring(state.iris_type or "UNKNOWN"):upper()
@@ -1461,7 +1549,7 @@ local function draw_iris_monitor()
     end
 
     term.setCursorPos(2, 5)
-    term.write("CONTROL LINK: ONLINE / JSG-GDO TELEMETRY")
+    term.write("CONTROL LINK: ONLINE / SGC IRIS SECURITY")
     term.setCursorPos(2, 6)
     term.write("IRIS STATE:   " .. iris_state .. "   TYPE: " .. iris_type)
     term.setCursorPos(2, 7)
@@ -1491,7 +1579,7 @@ local function draw_iris_monitor()
 
     draw_controls({
         "R FORCE REFRESH   B BACK",
-        "LIVE TELEMETRY: AUTO-REFRESH   JSG RETAINS CONTROL",
+        "GDO AUTH REQUIRED   AUTO-LOCK INCOMING   AUTO-REFRESH",
     })
 end
 
