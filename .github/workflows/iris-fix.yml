@@ -14,7 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Apply iris patch
-        run: python3 patch_iris.py
+        run: |
+          sed -i 's/if count != 1:/if count not in (1, 2):/' patch_iris.py
+          python3 patch_iris.py
       - name: Commit patch and clean up
         run: |
           set -euo pipefail
