@@ -1,6 +1,6 @@
 -- SGC-CC
 -- Stargate Command ComputerCraft control system for JSG
--- Target: Minecraft 1.20.1 Forge + Just Stargate Mod + CC:Tweaked
+-- Target: Minecraft 1.20.1 Forge + CC:Tweaked
 --
 -- Security-critical design rules:
 --   * pcall success is NOT JSG operation success.
@@ -337,6 +337,9 @@ end
 -- Gate discovery / monitoring state
 -----------------------------------------------------------------------
 
+local iris_toggle_reservation = nil
+local IRIS_TOGGLE_RESERVATION_TIMEOUT_MS = 7000
+
 local function clear_gate_state()
     state.connected = false
     state.gate_merged = false
@@ -356,6 +359,7 @@ local function clear_gate_state()
     state.iris_max_durability = nil
     state.iris_authorized = false
     state.iris_open_pending = false
+    iris_toggle_reservation = nil
 end
 
 local function find_gate()
@@ -514,9 +518,6 @@ end
 -- A toggle request is reserved until JSG confirms the requested state.
 -- This prevents the incoming-lock path and GDO path from issuing opposing
 -- toggles against the same stale iris state.
-local iris_toggle_reservation = nil
-local IRIS_TOGGLE_RESERVATION_TIMEOUT_MS = 7000
-
 local function toggle_iris_guarded(target_state, reason)
     local now_ms = os.epoch("utc")
 
@@ -617,7 +618,10 @@ local function process_gdo_code(received_code)
         end
         state.iris_open_pending = false
     elseif state.iris_state == "OPENED" then
-        state.iris_open_pending = false
+        state.iris_open_pending = iris_toggle_reservation ~= nil and iris_toggle_reservation.target_state == "CLOSED"
+        if state.iris_open_pending then
+            log_event("GDO AUTHENTICATED: waiting for security close before reopening")
+        end
     else
         state.iris_open_pending = true
         log_event("GDO AUTHENTICATED: iris state " .. tostring(state.iris_state or "UNKNOWN") .. "; opening pending")
@@ -1230,6 +1234,7 @@ local function handle_jsg_event(event, ...)
         state.incoming = false
         state.incoming_address = nil
         state.alert = nil
+        iris_toggle_reservation = nil
         stop_alarm_audio()
         log_event("WORMHOLE CLOSED: " .. address_to_string(address) .. " / " .. tostring(reason or "unknown") .. " / initiating=" .. tostring(initiating))
 
